@@ -6,7 +6,7 @@ from pathlib import Path
 from sqlalchemy import select
 from backend.ops.db import Database
 from backend.ops.store import Store, Conflict, Forbidden
-from backend.ops.schema import commands, chunks, attempts, jobs, artifacts, runs, audit, users
+from backend.ops.schema import commands, chunks, attempts, jobs, artifacts, runs, audit, users, stages
 from backend.ops.artifacts import LocalArtifacts
 from backend.ops.retention import Retention
 
@@ -252,6 +252,64 @@ class OpsCase(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await client.get('/v1/ops/jobs')).json()['items'], [])
                 self.assertEqual((await client.post('/v1/ops/jobs', headers={'Idempotency-Key': 'x'}, json={'title': 'x'})).status_code, 503)
                 self.assertEqual((await client.get('/ready')).status_code, 503)
+
+    async def test_artifact_download_preserves_pdf_and_jsonl_types(self):
+        import json
+        import httpx
+        from unittest.mock import patch
+        from urllib.parse import unquote
+        from backend.ops.api import create_app
+
+        jid = await self.new('download-formats')
+        pdf_data = b'%PDF-1.4\n1 0 obj\nendobj\n%%EOF'
+        jsonl_data = b'{"messages": []}\n'
+        pdf_manifest = self.objects.put(pdf_data)
+        jsonl_manifest = self.objects.put(jsonl_data)
+        pdf_id = await self.retention.register(jid, 'completed_datasets', pdf_manifest)
+        jsonl_id = await self.retention.register(jid, 'completed_datasets', jsonl_manifest)
+        async with self.db.transaction() as conn:
+            await conn.execute(stages.insert().values(
+                job_id=jid, name='publish', status='completed', lease='',
+                started=self.now, ended=self.now, updated=self.now,
+                snapshot=json.dumps({'files': {'review/review_selected.pdf': pdf_id,
+                    'sft/sft_pairs.jsonl': jsonl_id}, 'job': {'status': 'completed'}},
+                    ensure_ascii=False)))
+        app = create_app(self.db, self.objects)
+        with patch.dict(os.environ, {'OPS_TRUSTED_LOCAL_MODE': 'true'}):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                          base_url='http://test', follow_redirects=True) as client:
+                pdf = await client.get(f'/v1/jobs/{jid}/download/review_selected.pdf')
+                self.assertEqual(pdf.status_code, 200)
+                self.assertEqual(pdf.content, pdf_data)
+                self.assertTrue(pdf.headers['content-type'].startswith('application/pdf'))
+                self.assertIn('review_selected.pdf', unquote(pdf.headers['content-disposition']))
+                jsonl = await client.get(f'/v1/ops/artifacts/{jsonl_id}')
+                self.assertEqual(jsonl.status_code, 200)
+                self.assertEqual(jsonl.content, jsonl_data)
+                self.assertTrue(jsonl.headers['content-type'].startswith('application/x-ndjson'))
+                self.assertIn('sft_pairs.jsonl', unquote(jsonl.headers['content-disposition']))
+
+    async def test_original_pdf_upload_artifact_keeps_pdf_extension(self):
+        import json
+        import httpx
+        from unittest.mock import patch
+        from urllib.parse import unquote
+        from backend.ops.api import create_app
+        jid = await self.new('input-pdf')
+        data = b'%PDF-1.5\n%%EOF'
+        manifest = self.objects.put(data)
+        aid = await self.retention.register(jid, 'chunk_inputs', manifest)
+        async with self.db.transaction() as conn:
+            await conn.execute(jobs.update().where(jobs.c.id == jid).values(
+                config=json.dumps({'filename': 'temp.pdf', 'input_object': manifest})))
+        app = create_app(self.db, self.objects)
+        with patch.dict(os.environ, {'OPS_TRUSTED_LOCAL_MODE': 'true'}):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                          base_url='http://test') as client:
+                response = await client.get(f'/v1/ops/artifacts/{aid}')
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.headers['content-type'].startswith('application/pdf'))
+                self.assertIn('temp.pdf', unquote(response.headers['content-disposition']))
 
     async def test_jobs_page_newest_first_and_cursor(self):
         from backend.ops.queries import jobs_page

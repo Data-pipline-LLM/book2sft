@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from .store import Store, Conflict, Missing, Forbidden, authorize
 from .retention import Retention
-from .schema import jobs, chunks, attempts, commands, events, artifacts, policies, runs, audit
+from .schema import jobs, chunks, attempts, commands, events, artifacts, policies, runs, audit, stages
 
 
 class CreateJob(BaseModel):
@@ -193,6 +193,14 @@ def create_app(db, objects, *, workflow_ready=None):
                 raise Missing(artifact_id)
             if row['status'] != 'available':
                 raise HTTPException(410, 'artifact expired')
+            # Resolve the original name from durable job/stage metadata rather
+            # than always downloading "artifact.bin" (including Review PDFs).
+            snapshots = (await conn.execute(select(stages.c.snapshot).where(
+                stages.c.job_id == row['job_id']).order_by(stages.c.updated.desc()))).scalars().all()
+            config = (await conn.execute(select(jobs.c.config).where(
+                jobs.c.id == row['job_id']))).scalar_one_or_none()
+            from .downloads import file_info
+            filename, media_type, disposition = file_info(row, snapshots, config)
             try:
                 stream = await asyncio.to_thread(objects.open_reader, row['key'])
             except FileNotFoundError:
@@ -213,8 +221,9 @@ def create_app(db, objects, *, workflow_ready=None):
             finally:
                 await asyncio.to_thread(stream.close)
         from fastapi.responses import StreamingResponse
-        return StreamingResponse(content(), media_type='application/octet-stream',
-            headers={'Content-Disposition': 'attachment; filename="artifact.bin"', 'X-Content-SHA256':row['sha256']})
+        return StreamingResponse(content(), media_type=media_type,
+            headers={'Content-Disposition': disposition, 'X-Content-SHA256': row['sha256'],
+                     'Content-Length': str(row['size'])})
 
     @app.get('/v1/ops/artifacts/{artifact_id}/link')
     async def download_link(artifact_id: str, p=Depends(principal)):

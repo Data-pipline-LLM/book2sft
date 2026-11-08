@@ -143,10 +143,51 @@
       <td><span class="status-tag status-${escapeHTML(j.status)}"><i></i>${escapeHTML(labels[j.status]||j.status)}</span></td>
       <td><small>${when(j.updated)}</small></td><td>${num(j.attempt)}</td>
       <td><code class="mono">${escapeHTML(j.id.slice(0,8))}…</code></td>
-      <td><button type="button" class="ghost-btn table-action" data-open="${escapeHTML(j.id)}">جزئیات ←</button></td></tr>`).join('')||'<tr><td colspan="7" class="empty-state">کتابی با این فیلتر پیدا نشد.</td></tr>';
+      <td><div class="row-buttons"><button type="button" class="ghost-btn table-action" data-open="${escapeHTML(j.id)}">جزئیات ←</button><button type="button" class="ghost-btn table-action full-view-action" data-full="${escapeHTML(j.id)}">نمای کامل ↗</button></div></td></tr>`).join('')||'<tr><td colspan="7" class="empty-state">کتابی با این فیلتر پیدا نشد.</td></tr>';
     $('historyPrev').disabled=previousPages.length===0;
     $('historyNext').disabled=!nextPageCursor;
     $('historyPage').textContent=`صفحه ${num(previousPages.length+1)} · ${num(currentJobPage.length)} ردیف`;
+  }
+  const finalDownloadSpecs = [
+    ['sft_jsonl','sft_pairs.jsonl','دیتاست نهایی SFT','JSONL','primary'],
+    ['sft_with_chunks_jsonl','sft_pairs_with_chunks.jsonl','SFT همراه با متن Chunk','JSONL','primary'],
+    ['sft_axolotl_jsonl','sft_axolotl.jsonl','فرمت Axolotl / Chat','JSONL','primary'],
+    ['review_pdf','review_selected.pdf','PDF بررسی خروجی منتخب','PDF','primary'],
+    ['review_all_pdf','review_all_evaluated.pdf','PDF بررسی همه نمونه‌ها','PDF','primary'],
+    ['all_evaluated_jsonl','all_evaluated_pairs.jsonl','تمام نمونه‌های ارزیابی‌شده','JSONL','extra'],
+    ['sft_metrics_json','sft_metrics.json','آمار و زمان‌بندی SFT','JSON','extra'],
+    ['sft_errors_jsonl','sft_errors.jsonl','خطاهای SFT','JSONL','extra'],
+    ['chunks_jsonl','chunks.jsonl','متن Chunkها','JSONL','extra'],
+    ['ocr_json','ocr.json','خروجی OCR','JSON','extra'],
+    ['chunker_log','chunker.log','لاگ Chunker','LOG','extra'],
+  ];
+  function featuredDownloads(id, legacy){
+    if(legacy?.status!=='completed')return '';
+    const available=legacy?.result?.downloads||{};
+    const items=finalDownloadSpecs.filter(([key])=>Boolean(available[key]));
+    if(!items.length)return `<section class="featured-outputs"><h3>خروجی‌های نهایی</h3><p class="muted">این Job تکمیل شده ولی خروجی‌های نهایی در Snapshot فعلی یافت نشدند.</p></section>`;
+    const cards=items.map(([key,filename,title,format,kind])=>
+      `<a class="output-tile ${kind==='primary'?'output-tile-primary':''}" href="/v1/jobs/${encodeURIComponent(id)}/download/${encodeURIComponent(filename)}" download>
+        <span class="output-filetype">${format}</span><strong>${escapeHTML(title)}</strong><small>${escapeHTML(filename)}</small><span class="output-download">دریافت فایل ↓</span></a>`).join('');
+    return `<section class="featured-outputs" aria-label="خروجی‌های نهایی قابل دانلود">
+      <div class="featured-head"><div><span class="small-label">FINAL DELIVERABLES</span><h3>خروجی‌های نهایی این کتاب</h3></div><span class="featured-ready">✓ آماده دانلود</span></div>
+      <p class="muted mini-explain">همان خروجی‌های آپلود تکی؛ فایل‌ها با نام و فرمت واقعی (PDF / JSONL / JSON) دانلود می‌شوند.</p>
+      <div class="featured-grid">${cards}</div></section>`;
+  }
+  function updateDrawerProgress(legacy, fallbackStatus){
+    const node=$('drawerProgress');
+    if(!node)return;
+    const isFinal= fallbackStatus==='completed';
+    const raw=Number(legacy?.progress);
+    const known=legacy && legacy.progress!==undefined && legacy.progress!==null && Number.isFinite(raw);
+    const value=isFinal?100:known?Math.max(0,Math.min(100,raw)):0;
+    const stage=legacy?.stage||'—';
+    const local=Number(legacy?.stage_progress);
+    const stageText=stage==='—'?'مرحله نامشخص':(legacy?.message||stage);
+    node.innerHTML=`<div class="drawer-progress-heading"><strong>پیشرفت کل کتاب</strong><b>${isFinal?'۱۰۰٪':known?escapeHTML(num(value))+'٪':'—'}</b></div>
+      <div class="drawer-progress-track" role="progressbar" aria-label="پیشرفت کل کتاب" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${value.toFixed(1)}"><div style="width:${value}%"></div></div>
+      <div class="drawer-progress-caption"><span>${escapeHTML(stageText)}</span><span>${Number.isFinite(local)&&legacy?.stage_progress!=null?`پیشرفت مرحله ${num(local)}٪`:'پیشرفت مرحله —'}</span></div>
+      <small class="muted">${isFinal?'Job با موفقیت تکمیل شده است.':known?'درصد برآوردی Pipeline بر اساس پیشرفت ثبت‌شده؛ نه شمارش ساده Chunkها.':'هنوز درصد پیشرفت در Snapshot ثبت نشده است.'}</small>`;
   }
   const readableJSON = text => {if (typeof text === 'string') {try{return JSON.parse(text);}catch{return text;}}return text;};
   const facts = data => Object.entries(data||{}).map(([key,v])=>`<div class="field-row"><span>${escapeHTML(key)}</span><strong>${escapeHTML(v==null?'—':typeof v==='object'?JSON.stringify(v).slice(0,200):v)}</strong></div>`).join('');
@@ -181,17 +222,21 @@
     $('jobDrawer').classList.remove('hidden');document.body.classList.add('drawer-open');
     $('drawerBody').innerHTML=placeholder('در حال بارگذاری جزئیات…');
     try {
-      const [job,chunks,attempts,events,artifacts] = await Promise.all([
+      const [job,chunks,attempts,events,artifacts,legacy] = await Promise.all([
         api('/v1/ops/jobs/'+encodeURIComponent(id)),
         pagedDetail(`/v1/ops/jobs/${encodeURIComponent(id)}/chunks`),
         pagedDetail(`/v1/ops/jobs/${encodeURIComponent(id)}/attempts`),
         pagedDetail(`/v1/ops/jobs/${encodeURIComponent(id)}/events`),
-        pagedDetail(`/v1/ops/jobs/${encodeURIComponent(id)}/artifacts`)]);
+        pagedDetail(`/v1/ops/jobs/${encodeURIComponent(id)}/artifacts`),
+        api('/v1/jobs/'+encodeURIComponent(id)).catch(()=>null)]);
       if(selectedJob!==id)return;
       $('drawerTitle').textContent=job.title||'کتاب';$('drawerId').textContent=id;
       const commandOptions=availableActions(job.status);
       const stageHtml=(job.stages||[]).map(s=>`<div class="detail-timing-row"><strong>${escapeHTML(s.name)}</strong><span>${escapeHTML(labels[s.status]||s.status)}</span><small>${s.started&&s.ended?secs(s.ended-s.started):'—'}</small></div>`).join('');
       $('drawerBody').innerHTML=`<div class="drawer-top-status"><span class="status-tag status-${escapeHTML(job.status)}">${escapeHTML(labels[job.status]||job.status)}</span><span>${when(job.updated)}</span></div>
+        <div id="drawerProgress" class="drawer-progress"></div>
+        <button type="button" class="full-job-button" data-full="${escapeHTML(id)}">↗ مشاهده نمای کامل کتاب (مانند آپلود تکی)</button>
+        ${featuredDownloads(id,legacy)}
         <div class="drawer-metrics"><div><span>کتاب</span><strong>${escapeHTML(job.book_id)}</strong></div><div><span>تلاش</span><strong>${num(job.attempt)}</strong></div><div><span>قابل Resume</span><strong>${job.resumable?'بله':'خیر'}</strong></div><div><span>Chunkها</span><strong>${num(Object.values(job.chunks||{}).reduce((a,v)=>a+v,0))}</strong></div></div>
         <div class="ops-actions">${commandOptions.map(([a,title])=>`<button type="button" class="ghost-btn ${a==='delete'?'danger-btn':''}" data-command="${a}">${title}</button>`).join('')||'<span class="muted">برای این وضعیت عملیاتی وجود ندارد.</span>'}</div>
         <div id="commandNotice" class="muted mini-explain">عملیات روی صف پایدار ثبت می‌شود؛ تکمیل واقعی با بروزرسانی وضعیت مشخص می‌شود.</div>
@@ -201,8 +246,9 @@
         ${attempts.next_cursor?`<button class="ghost-btn load-detail" data-next="attempts" data-cursor="${escapeHTML(attempts.next_cursor)}">تلاش‌های بیشتر</button>`:''}
         <h3>رویدادها <small>۵۰ رکورد اول</small></h3><div id="eventDetails">${detailsRows(events.items,'events')}</div>
         ${events.next_cursor?`<button class="ghost-btn load-detail" data-next="events" data-cursor="${escapeHTML(events.next_cursor)}">رویدادهای بیشتر</button>`:''}
-        <h3>فایل‌های خروجی</h3><div id="artifactDetails">${detailsRows(artifacts.items,'artifacts')}</div>
+        <h3>همه Artifactها <small>فایل‌های میانی، لاگ و خروجی‌های ثبت‌شده</small></h3><div id="artifactDetails">${detailsRows(artifacts.items,'artifacts')}</div>
         ${artifacts.next_cursor?`<button class="ghost-btn load-detail" data-next="artifacts" data-cursor="${escapeHTML(artifacts.next_cursor)}">خروجی‌های بیشتر</button>`:''}`;
+      updateDrawerProgress(legacy,job.status);
     } catch(e){if(selectedJob===id)$('drawerBody').innerHTML=placeholder('دریافت اطلاعات ناموفق بود: '+e.message);}
   }
   const availableActions=status=>{
@@ -278,8 +324,17 @@
   $('historyReload').onclick=()=>{resetHistory();loadJobs().catch(e=>note(e.message,true));};
   $('historyPrev').onclick=()=>{if(!previousPages.length)return;cursor=previousPages.pop();loadJobs().catch(e=>note(e.message,true));};
   $('historyNext').onclick=()=>{if(!nextPageCursor)return;previousPages.push(cursor);cursor=nextPageCursor;loadJobs().catch(e=>note(e.message,true));};
+  function fullJobView(id){
+    selectedJob=null;
+    $('jobDrawer').classList.add('hidden');
+    document.body.classList.remove('drawer-open');
+    location.hash='upload';
+    switchView('upload');
+    if(window.book2sftOpenExistingJob)window.book2sftOpenExistingJob(id);
+  }
   $('historyRows').onclick=e=>{
-    const row=e.target.closest('[data-open]');if(row)openJob(row.dataset.open);
+    const full=e.target.closest('[data-full]');if(full){fullJobView(full.dataset.full);return;}
+    const row=e.target.closest('[data-open]');if(row){openJob(row.dataset.open);return;}
     const checkbox=e.target.closest('[data-pick]');if(checkbox){checkbox.checked?selected.add(checkbox.dataset.pick):selected.delete(checkbox.dataset.pick);updateSelected();}
   };
   $('bulkApply').onclick=async()=>{
@@ -295,6 +350,7 @@
   };
   $('drawerClose').onclick=$('drawerBackdrop').onclick=()=>{selectedJob=null;$('jobDrawer').classList.add('hidden');document.body.classList.remove('drawer-open');};
   $('drawerBody').onclick=async e=>{
+    const full=e.target.closest('[data-full]');if(full){fullJobView(full.dataset.full);return;}
     const c=e.target.closest('[data-command]');
     if(c){c.disabled=true;try{await command(selectedJob,c.dataset.command);}catch(e){note(e.message,true);}finally{c.disabled=false;}return;}
     const more=e.target.closest('.load-detail');if(more)await loadMore(more);
@@ -303,5 +359,17 @@
   $('retentionPreview').onclick=async()=>{try{const result=await api('/v1/admin/retention/preview',{method:'POST'});note(`پیش‌نمایش: ${num(result.count)} فایل (${num(result.bytes)} بایت)، حذف انجام نشد.`);}catch(e){note(e.message,true);}};
   $('retentionDryRun').onclick=async()=>{try{const result=await api('/v1/admin/retention/runs',{method:'POST',json:{dry_run:true}});note(`Dry-run ثبت شد: ${result.run_id}`);}catch(e){note(e.message,true);}};
   setInterval(()=>{if(alive()&&$('monitorAuto').checked&&!selectedJob)refresh();},15000);
+  // Lightweight progress polling while inspecting a running job. Do not reload
+  // 50 chunks/attempts/events/artifacts on each tick.
+  let drawerProgressPolling=false;
+  setInterval(async()=>{
+    const id=selectedJob;
+    if(!id||document.hidden||drawerProgressPolling||!$('drawerProgress'))return;
+    drawerProgressPolling=true;
+    try{
+      const state=await api('/v1/jobs/'+encodeURIComponent(id));
+      if(selectedJob===id)updateDrawerProgress(state,state.status);
+    }catch(_){}finally{drawerProgressPolling=false;}
+  },6000);
   switchView(location.hash==='#monitor'?'monitor':'upload');
 })();

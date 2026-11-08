@@ -299,3 +299,21 @@ setInterval(() => {
     refreshJobStatus(activeJobId);
   }
 }, 5000);
+// From Job Explorer: reuse the original single-upload dashboard for any
+// existing Job. This shows its timings, SFT targets, progress and downloads
+// without resubmitting the book or creating a parallel UI.
+window.book2sftOpenExistingJob = function(jobId) {
+  if (!/^[a-f0-9-]{20,64}$/i.test(String(jobId))) return;
+  if (source) { source.close(); source = null; }
+  currentJob = null;
+  activeJobId = null;
+  $("errorBox").classList.add("hidden");
+  $("resultSummary").classList.add("hidden");
+  $("warnings").classList.add("hidden");
+  $("downloads").classList.add("hidden");
+  $("downloads").innerHTML = "";
+  $("jobPanel").classList.remove("hidden");
+  $("jobTitle").textContent = "در حال دریافت Job…";
+  connectEvents(jobId);
+  setTimeout(() => $("jobPanel").scrollIntoView({behavior:"smooth", block:"start"}), 100);
+};
