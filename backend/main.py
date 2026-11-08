@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from .monitoring import MonitorIndex, inspect_errors
 from typing import Any, AsyncIterator
 
 import httpx
@@ -64,6 +65,8 @@ SFT_TARGET_LANGUAGE = os.getenv("SFT_TARGET_LANGUAGE", "fa")
 SFT_DEFAULT_DOMAIN = os.getenv("SFT_DEFAULT_DOMAIN", "general")
 SFT_BOOK_SELECTION_TIMEOUT_SEC = max(30.0, env_float("SFT_BOOK_SELECTION_TIMEOUT_SEC", 900.0))
 logger = logging.getLogger("book2sft.sft")
+MONITOR_DB_PATH = Path(os.getenv("MONITOR_DB_PATH", "/data/monitoring/monitoring.sqlite3"))
+MONITOR_RECONCILE_SEC = max(60, env_int("MONITOR_RECONCILE_SEC", 300))
 PDF_SCRIPT = Path(os.getenv("SFT_REVIEW_PDF_SCRIPT", "/app/tools/sft_jsonl_to_review_pdf_audit.py"))
 
 
@@ -297,13 +300,40 @@ class JobManager:
         self.subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
         self.worker_tasks: list[asyncio.Task[Any]] = []
         self._io_lock = asyncio.Lock()
+        self.monitor = MonitorIndex(MONITOR_DB_PATH, DATA_ROOT)
+        self.session_jobs: set[str] = set()
+        self._monitor_updated: dict[str, float] = {}
+        self._monitor_task: asyncio.Task[Any] | None = None
 
     async def start(self) -> None:
         DATA_ROOT.mkdir(parents=True, exist_ok=True)
+        try:
+            await asyncio.to_thread(self.monitor.initialize)
+            self._monitor_task = asyncio.create_task(self.reconcile_monitor(), name="monitor-index")
+        except Exception:
+            logger.exception("Monitoring database initialization failed; pipeline remains enabled")
         for idx in range(JOB_WORKERS):
             self.worker_tasks.append(asyncio.create_task(self.worker(idx), name=f"job-worker-{idx}"))
 
+    async def reconcile_monitor(self) -> None:
+        while True:
+            try:
+                await asyncio.to_thread(self.monitor.reconcile, self.session_jobs)
+            except Exception:
+                logger.exception("Monitoring history reconciliation failed")
+            # Keep the in-memory registry bounded. Historical jobs are loaded
+            # on demand from job.json, not held for the lifetime of the API.
+            done = [(j.updated_at, jid) for jid, j in self.jobs.items()
+                    if j.status in {"completed", "failed"} and not self.subscribers.get(jid)]
+            for _, jid in sorted(done, reverse=True)[200:]:
+                self.jobs.pop(jid, None)
+                self._monitor_updated.pop(jid, None)
+            await asyncio.sleep(MONITOR_RECONCILE_SEC)
+
     async def stop(self) -> None:
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            await asyncio.gather(self._monitor_task, return_exceptions=True)
         for task in self.worker_tasks:
             task.cancel()
         if self.worker_tasks:
@@ -324,6 +354,18 @@ class JobManager:
             tmp = path.with_suffix(".tmp")
             tmp.write_text(payload, encoding="utf-8")
             tmp.replace(path)
+            # Throttle live indexing; terminal transitions always persist immediately.
+            now = time.monotonic()
+            previous = self._monitor_updated.get(job.job_id, 0.0)
+            if now - previous >= 3 or job.status in {"failed", "completed"}:
+                self._monitor_updated[job.job_id] = now
+                try:
+                    await asyncio.to_thread(self.monitor.upsert, job.as_dict())
+                except Exception:
+                    # Index failure must not stop generation of user data.
+                    logger.exception("Monitoring index write failed for job=%s", job.job_id)
+                if job.status in {"failed", "completed"}:
+                    self._monitor_updated.pop(job.job_id, None)
 
     async def emit(self, job: JobState, event_type: str = "progress", extra: dict[str, Any] | None = None) -> None:
         event = {"type": event_type, "ts": utcnow(), "job": job.as_dict()}
@@ -478,6 +520,7 @@ class JobManager:
                 "elapsed_sec": 0.0, "status": "skipped",
             }
         self.jobs[job_id] = job
+        self.session_jobs.add(job_id)
         await self.persist(job)
         await self.emit(job, "job_created")
         await self.queue.put(job_id)
@@ -1193,8 +1236,8 @@ class JobManager:
         data = json.loads(state_path.read_text(encoding="utf-8"))
         job = JobState(
             job_id=data["job_id"],
-            filename=data["filename"],
-            size_bytes=data["size_bytes"],
+            filename=data.get("filename", ""),
+            size_bytes=data.get("size_bytes", 0),
             input_type=data.get("input_type", "pdf"),
             book_title=data.get("book_title", ""),
             category=data.get("category", ""),
@@ -1207,7 +1250,6 @@ class JobManager:
         ]:
             if key in data:
                 setattr(job, key, data[key])
-        self.jobs[job_id] = job
         return job
 
     async def subscribe(self, job_id: str) -> AsyncIterator[dict[str, Any]]:
@@ -1326,6 +1368,93 @@ async def create_job(
         "status_url": f"/v1/jobs/{job.job_id}",
         "events_url": f"/v1/jobs/{job.job_id}/events",
     }
+
+
+@app.get("/v1/monitoring/jobs")
+async def monitoring_jobs(
+    q: str = "", status: str = "", input_type: str = "", stage: str = "",
+    since: str = "", until: str = "", page: int = 1, page_size: int = 25,
+    sort: str = "newest",
+) -> dict[str, Any]:
+    if not 1 <= page <= 1000000 or not 1 <= page_size <= 100:
+        raise HTTPException(status_code=422, detail="page must be positive and page_size must be 1..100")
+    if len(q) > 120 or len(since) > 45 or len(until) > 45:
+        raise HTTPException(status_code=422, detail="Invalid filter length")
+    if status not in {"", "active", "queued", "running", "completed", "failed", "interrupted"}:
+        raise HTTPException(status_code=422, detail="Unknown status")
+    if input_type not in {"", "pdf", "ocr_json"}:
+        raise HTTPException(status_code=422, detail="Unknown input type")
+    if sort not in {"newest", "oldest", "slowest", "most_failed"}:
+        raise HTTPException(status_code=422, detail="Unknown sort")
+    return await asyncio.to_thread(
+        manager.monitor.list_jobs, q=q, status=status, input_type=input_type,
+        stage=stage, since=since, until=until, page=page,
+        page_size=page_size, sort=sort,
+    )
+
+
+@app.get("/v1/monitoring/overview")
+async def monitoring_overview(days: int = 30) -> dict[str, Any]:
+    if days not in {0, 7, 30, 90}:
+        raise HTTPException(status_code=422, detail="days must be 0, 7, 30 or 90")
+    return await asyncio.to_thread(manager.monitor.overview, days)
+
+
+@app.get("/v1/monitoring/jobs/{job_id}")
+async def monitoring_job_detail(job_id: str) -> dict[str, Any]:
+    summary = await asyncio.to_thread(manager.monitor.get_summary, job_id)
+    state_path = manager.state_path(job_id)
+    if state_path.is_file():
+        job = manager.get(job_id)
+        if not summary:
+            await asyncio.to_thread(manager.monitor.upsert, job.as_dict())
+            summary = await asyncio.to_thread(manager.monitor.get_summary, job_id)
+        payload = job.as_dict()
+    elif summary:
+        # Compact historical information survives the cleanup of data/jobs.
+        payload = {
+            "job_id": job_id, "filename": summary["filename"],
+            "book_title": summary["book_title"], "category": summary["category"],
+            "domain": summary["domain"], "input_type": summary["input_type"],
+            "status": summary["status"], "stage": summary["stage"],
+            "progress": summary["progress"], "total_elapsed_sec": summary["duration_sec"],
+            "created_at": summary["created_at"], "updated_at": summary["updated_at"],
+            "started_at": summary["started_at"], "completed_at": summary["completed_at"],
+            "message": "Only monitoring metadata remains; job artifacts have been cleaned up.",
+            "timings": summary["timings"], "eta_sec": None,
+            "metrics": {"pipeline": {
+                "chunker": {"chunk_count": summary["chunk_count"]},
+                "sft": {"total_chunks": summary["chunk_count"],
+                        "completed_chunks": summary["completed_chunks"],
+                        "failed_chunks": summary["failed_chunks"],
+                        "generated_pairs": summary["generated_pairs"],
+                        "selected_pairs": summary["selected_pairs"],
+                        "timings_sum_sec": summary["internal_timings_sum_sec"]},
+            }},
+            "error": {"code": summary["error_code"], "details": summary["error_details"]} if summary["error_code"] else None,
+        }
+    else:
+        raise HTTPException(status_code=404, detail="Job not found")
+    available = {
+        name: f"/v1/jobs/{job_id}/download/{name}"
+        for name, (relative, _) in ARTIFACTS.items()
+        if (manager.job_dir(job_id) / relative).is_file()
+    }
+    return {"job": payload, "summary": summary, "downloads": available,
+            "artifacts_present": bool(summary and summary.get("artifacts_present", 1))}
+
+
+@app.get("/v1/monitoring/jobs/{job_id}/errors")
+async def monitoring_job_errors(job_id: str, limit: int = 15) -> dict[str, Any]:
+    if not 1 <= limit <= 50:
+        raise HTTPException(status_code=422, detail="limit must be 1..50")
+    summary = await asyncio.to_thread(manager.monitor.get_summary, job_id)
+    if not summary and not manager.state_path(job_id).is_file():
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not manager.job_dir(job_id).is_dir():
+        return {"available": False, "reason": "artifacts_purged", "sampled": 0,
+                "http_statuses": [], "examples": []}
+    return await asyncio.to_thread(inspect_errors, manager.job_dir(job_id), limit=limit)
 
 
 @app.get("/v1/jobs/{job_id}")

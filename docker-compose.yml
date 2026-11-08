@@ -9,6 +9,7 @@ services:
       - "8088:8088"
     volumes:
       - ./data/jobs:/data/jobs
+      - ./data/monitoring:/data/monitoring
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:

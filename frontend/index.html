@@ -7,7 +7,18 @@
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
+  <header class="app-header">
+    <div class="app-header-inner">
+      <a class="brand" href="#upload" aria-label="Book2SFT"> <span class="brand-mark">B<span>2</span></span><span><strong>Book2SFT</strong><small>PIPELINE CONTROL CENTER</small></span></a>
+      <nav class="nav-tabs" aria-label="بخش‌های سامانه">
+        <button type="button" class="nav-tab active" data-view="upload">آپلود تکی</button>
+        <button type="button" class="nav-tab" data-view="monitor">مانیتورینگ <span class="nav-dot"></span></button>
+      </nav>
+      <span class="header-caption">DATA OPERATIONS <span class="header-live">●</span></span>
+    </div>
+  </header>
   <main class="shell">
+    <div id="uploadView">
     <section class="hero">
       <div>
         <p class="eyebrow">BOOK2SFT · FULL PIPELINE</p>
@@ -19,11 +30,17 @@
 
     <section class="card upload-card">
       <form id="uploadForm">
+        <div class="input-mode-header"><div><strong>نوع ورودی کتاب</strong><p class="muted">از PDF خام یا JSON خروجی OCR استفاده کنید.</p></div>
+          <div class="segmented" role="group" aria-label="نوع فایل">
+            <button type="button" class="mode-button active" data-kind="pdf">PDF</button>
+            <button type="button" class="mode-button" data-kind="ocr_json">OCR JSON</button>
+          </div>
+        </div>
         <label class="drop" for="pdfFile">
-          <strong>فایل PDF یا خروجی OCR با فرمت JSON را انتخاب کنید</strong>
+          <strong><span id="inputHint">فایل PDF را انتخاب کنید</span></strong>
           <span id="fileName">هنوز فایلی انتخاب نشده</span>
-          <input id="pdfFile" name="input_file" type="file" accept=".pdf,.json,application/pdf,application/json" required />
-          <small class="muted">با فایل OCR JSON، فراخوانی OCR حذف می‌شود؛ بقیه مراحل Chunker و SFT اجرا می‌شوند.</small>
+          <input id="pdfFile" name="input_file" type="file" accept=".pdf,application/pdf" required />
+          <small class="muted" id="inputDescription">مسیر کامل OCR → Chunker → SFT اجرا می‌شود.</small>
         </label>
         <div class="form-grid">
           <label><span>عنوان کتاب (اختیاری)</span><input id="bookTitle" type="text" placeholder="از نام فایل استفاده می‌شود" /></label>
@@ -95,7 +112,62 @@
       <div id="downloads" class="downloads hidden"></div>
       <pre id="errorBox" class="error hidden"></pre>
     </section>
+    </div>
+
+    <section id="monitorView" class="hidden monitoring-view" aria-label="داشبورد مانیتورینگ">
+      <div class="monitor-title-row">
+        <div><p class="eyebrow monitor-eyebrow">OPERATIONS / OBSERVABILITY</p>
+          <h1>مانیتورینگ پایپلاین</h1>
+          <p class="muted">نمای لحظه‌ای عملیات، تحلیل عملکرد سرویس‌ها و تاریخچه قابل جست‌وجوی تمام کتاب‌ها</p>
+        </div>
+        <div class="monitor-controls"><span id="monitorUpdated" class="muted monitor-freshness">—</span><button type="button" id="monitorRefresh" class="ghost-btn">↻ بروزرسانی</button></div>
+      </div>
+      <div id="monitorAlert" class="monitor-alert hidden" role="status"></div>
+      <div class="monitor-toolbar">
+        <label>بازه زمانی <select id="monitorDays"><option value="7">۷ روز اخیر</option><option value="30" selected>۳۰ روز اخیر</option><option value="90">۹۰ روز اخیر</option><option value="0">کل تاریخچه</option></select></label>
+        <div class="monitor-auto"><span class="pulse-dot"></span> بروزرسانی خودکار هر ۱۵ ثانیه</div>
+      </div>
+      <section class="overview-grid" aria-label="شاخص‌های کلیدی">
+        <article class="kpi"><span>کل Jobها</span><strong id="kpiTotal">—</strong><small>در بازه انتخابی</small></article>
+        <article class="kpi"><span>در حال اجرا / صف</span><strong id="kpiActive">—</strong><small>Jobهای فعال سیستم</small></article>
+        <article class="kpi"><span>نرخ موفقیت Job</span><strong id="kpiSuccess">—</strong><small>فقط Jobهای پایان‌یافته</small></article>
+        <article class="kpi"><span>چانک‌های ناموفق</span><strong id="kpiFailed">—</strong><small id="kpiFailedRate">—</small></article>
+        <article class="kpi"><span>زمان میانه Job</span><strong id="kpiDuration">—</strong><small id="kpiP95">P95: —</small></article>
+        <article class="kpi"><span>جفت‌های SFT نهایی</span><strong id="kpiPairs">—</strong><small id="kpiGenerated">—</small></article>
+      </section>
+      <section class="monitor-analytics-grid">
+        <article class="dashboard-card graph-large"><div class="section-heading"><div><span class="small-label">WORKLOAD</span><h3>روند دریافت و تکمیل Jobها</h3></div><span class="muted">به تفکیک روز ایجاد</span></div><div id="dailyChart" class="chart-holder"></div></article>
+        <article class="dashboard-card graph-small"><div class="section-heading"><div><span class="small-label">JOB STATES</span><h3>توزیع وضعیت‌ها</h3></div></div><div id="statusChart" class="chart-holder"></div></article>
+        <article class="dashboard-card graph-large"><div class="section-heading"><div><span class="small-label">LATENCY</span><h3>زمان پردازش به تفکیک سرویس</h3></div><small>میانگین و P95، برحسب زمان دیواری Job</small></div><div id="serviceChart" class="chart-holder"></div></article>
+        <article class="dashboard-card graph-small"><div class="section-heading"><div><span class="small-label">FAILURE SIGNALS</span><h3>علت شکست Jobها</h3></div></div><div id="errorChart" class="chart-holder"></div></article>
+        <article class="dashboard-card graph-wide"><div class="section-heading"><div><span class="small-label">SFT / SUBSERVICES</span><h3>هزینه تجمعی زیرسرویس‌های Data Generator</h3></div><small>جمع زمان ثبت‌شده روی چانک‌ها؛ شامل هم‌پوشانی پردازش موازی است.</small></div><div id="internalChart" class="chart-holder"></div></article>
+      </section>
+      <section class="dashboard-card health-card"><div class="section-heading"><div><span class="small-label">DEPENDENCIES</span><h3>وضعیت اتصال سرویس‌ها</h3></div><small>این تست، سلامت API را بررسی می‌کند؛ سلامت LLM پایین‌دستی را تضمین نمی‌کند.</small></div><div id="serviceHealth" class="service-health-grid"></div></section>
+      <section class="dashboard-card history-card">
+        <div class="section-heading"><div><span class="small-label">JOB EXPLORER</span><h2>Job Explorer <span id="historyCount" class="small-count">—</span></h2></div><p class="muted">فیلتر سمت سرور، با قابلیت جست‌وجوی کتاب و شناسه Job</p></div>
+        <div class="history-filters">
+          <input id="historySearch" type="search" placeholder="جست‌وجوی عنوان، نام فایل یا Job ID..." aria-label="جستجوی Job" />
+          <select id="historyStatus" aria-label="وضعیت"><option value="">همه وضعیت‌ها</option><option value="active">فعال / صف</option><option value="completed">تکمیل‌شده</option><option value="failed">ناموفق</option><option value="interrupted">متوقف‌شده</option><option value="queued">در صف</option><option value="running">در حال اجرا</option></select>
+          <select id="historyInput" aria-label="نوع ورودی"><option value="">همه ورودی‌ها</option><option value="pdf">PDF</option><option value="ocr_json">OCR JSON</option></select>
+          <select id="historyStage" aria-label="مرحله"><option value="">همه مراحل</option><option value="ocr">OCR</option><option value="chunking">Chunking</option><option value="atomizing">Atomizing</option><option value="sft_generation">SFT Generation</option><option value="sft_book_selection">Book Selection</option><option value="review_pdf">Review PDF</option><option value="failed">Failed</option><option value="completed">Completed</option></select>
+          <input id="historySince" type="date" aria-label="از تاریخ" title="تاریخ شروع" />
+          <input id="historyUntil" type="date" aria-label="تا تاریخ" title="تاریخ پایان" />
+          <select id="historySort" aria-label="مرتب‌سازی"><option value="newest">جدیدترین</option><option value="oldest">قدیمی‌ترین</option><option value="slowest">طولانی‌ترین</option><option value="most_failed">بیشترین خطای چانک</option></select>
+          <select id="historyPageSize" aria-label="تعداد ردیف"><option value="25">۲۵ / صفحه</option><option value="50">۵۰ / صفحه</option><option value="100">۱۰۰ / صفحه</option></select>
+        </div>
+        <div class="history-table-wrap"><table class="history-table"><thead><tr><th>کتاب / Job</th><th>وضعیت</th><th>مرحله</th><th>پیشرفت</th><th>چانک / خطا</th><th>مدت</th><th>زمان ایجاد</th><th></th></tr></thead><tbody id="historyRows"><tr><td colspan="8" class="empty-state">در حال بارگذاری…</td></tr></tbody></table></div>
+        <div class="history-footer"><span id="historyRange" class="muted">—</span><div class="pagination"><button type="button" class="ghost-btn" id="historyPrev">قبلی</button><span id="historyPage">۱</span><button type="button" class="ghost-btn" id="historyNext">بعدی</button></div></div>
+      </section>
+    </section>
   </main>
+  <div id="jobDrawer" class="drawer-overlay hidden" role="dialog" aria-modal="true" aria-label="جزئیات Job">
+    <div id="drawerBackdrop" class="drawer-backdrop"></div>
+    <aside class="job-drawer">
+      <div class="drawer-head"><div><p class="small-label">JOB INSPECTOR</p><h2 id="drawerTitle">—</h2><span id="drawerId" class="mono muted"></span></div><button type="button" class="close-drawer" id="drawerClose" aria-label="بستن">×</button></div>
+      <div id="drawerBody" class="drawer-body"><p>در حال دریافت جزئیات…</p></div>
+    </aside>
+  </div>
   <script src="/static/app.js"></script>
+  <script src="/static/monitoring.js"></script>
 </body>
 </html>

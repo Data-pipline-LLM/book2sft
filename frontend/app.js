@@ -36,7 +36,7 @@ async function refreshJobStatus(jobId) {
 
 
 const STAGE_LABELS = {
-  upload: "آپلود PDF",
+  upload: "آپلود فایل",
   chunker_submit: "ارسال به Chunker",
   chunker_waiting: "انتظار در صف Chunker",
   ocr: "OCR",
@@ -221,6 +221,20 @@ async function checkHealth() {
   }
 }
 
+// Explicit input mode in the single-upload view (backend also checks extension/content).
+let uploadInputKind = "pdf";
+for (const button of document.querySelectorAll(".mode-button")) {
+  button.addEventListener("click", () => {
+    uploadInputKind = button.dataset.kind;
+    document.querySelectorAll(".mode-button").forEach(b => b.classList.toggle("active", b === button));
+    $("pdfFile").accept = uploadInputKind === "pdf" ? ".pdf,application/pdf" : ".json,application/json";
+    $("pdfFile").value = "";
+    $("fileName").textContent = "هنوز فایلی انتخاب نشده";
+    $("inputHint").textContent = uploadInputKind === "pdf" ? "فایل PDF را انتخاب کنید" : "فایل خروجی OCR با فرمت JSON را انتخاب کنید";
+    $("inputDescription").textContent = uploadInputKind === "pdf" ? "مسیر کامل OCR → Chunker → SFT اجرا می‌شود." : "OCR رد می‌شود؛ نرمال‌سازی، Chunker و SFT اجرا می‌شوند.";
+  });
+}
+
 $("pdfFile").addEventListener("change", (e) => {
   const f = e.target.files?.[0];
   $("fileName").textContent = f ? `${f.name} — ${(f.size / 1024 / 1024).toFixed(2)} MB` : 'هنوز فایلی انتخاب نشده';
@@ -230,8 +244,8 @@ $("uploadForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const file = $("pdfFile").files?.[0];
   if (!file) return;
-  if (!/\.(pdf|json)$/i.test(file.name)) {
-    alert('فقط فایل PDF یا OCR JSON قابل قبول است.');
+  if (uploadInputKind === "pdf" ? !/\.pdf$/i.test(file.name) : !/\.json$/i.test(file.name)) {
+    alert('فرمت فایل با نوع ورودی انتخاب‌شده مطابقت ندارد.');
     return;
   }
   $("submitBtn").disabled = true;
