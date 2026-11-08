@@ -1,11 +1,9 @@
 """Explicit, non-destructive operations setup. Never implicitly mutates legacy jobs."""
 import argparse
 import asyncio
-import getpass
 import os
 from .db import Database
 from .store import Store
-from .auth import Auth
 
 
 async def run(args):
@@ -48,12 +46,6 @@ async def run(args):
             from .artifacts import S3Artifacts
             objects = S3Artifacts(os.environ['OPS_S3_BUCKET'], endpoint_url=os.getenv('OPS_S3_ENDPOINT'))
             print(await import_legacy(Store(db), objects, args.root, apply=args.apply))
-        elif args.action == 'create-user':
-            password = getpass.getpass('New password (12+ characters): ')
-            if password != getpass.getpass('Repeat password: '):
-                raise ValueError('passwords differ')
-            await Auth(Store(db)).create_user(args.user, password, args.role, 'local-bootstrap', 'admin')
-            print('User created; password was not persisted in plaintext.')
         elif args.action in {'backup', 'restore-empty'}:
             from .backup import backup, restore
             result = await (backup(db, args.path) if args.action == 'backup' else restore(db, args.path))
@@ -72,9 +64,6 @@ def main():
     migrate = sub.add_parser('import-legacy')
     migrate.add_argument('root')
     migrate.add_argument('--apply', action='store_true', help='Default is a read-only dry run')
-    user = sub.add_parser('create-user')
-    user.add_argument('user')
-    user.add_argument('--role', choices=['viewer', 'operator', 'admin'], default='admin')
     for action in ('backup', 'restore-empty'):
         command = sub.add_parser(action)
         command.add_argument('path')

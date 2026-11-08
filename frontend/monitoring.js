@@ -1,266 +1,307 @@
-/* Book2SFT Operations Center: zero-dependency, server-paginated monitoring. */
+/* Book2SFT — existing dashboard, now backed by the durable operations APIs.
+ * Pure browser JS; all history pages and analytical series are server-bounded.
+ * No login, user-management UI or client-held service credentials.
+ */
 (() => {
   'use strict';
-  const el = id => document.getElementById(id);
-  const safe = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  const number = n => new Intl.NumberFormat('fa-IR').format(Number(n) || 0);
-  const sec = value => {
-    if (value === undefined || value === null) return '—';
-    const n = Number(value);
-    if (!Number.isFinite(n)) return '—';
-    if (n < 60) return `${n.toFixed(1)}s`;
-    if (n < 3600) return `${Math.floor(n / 60)}m ${Math.round(n % 60)}s`;
-    return `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`;
-  };
-  const date = value => value ? new Intl.DateTimeFormat('fa-IR', {dateStyle:'medium',timeStyle:'short'}).format(new Date(value)) : '—';
-  const stages = typeof STAGE_LABELS !== 'undefined' ? STAGE_LABELS : {};
-  const STATUS = {queued:'در صف', running:'در حال اجرا', completed:'تکمیل‌شده', failed:'ناموفق', interrupted:'متوقف‌شده'};
-  const colors = {completed:'#14b8a6', running:'#4976ef', queued:'#e5aa4a', failed:'#ed6e77', interrupted:'#94a3b8'};
-  const groupName = {'OCR':'OCR', 'Chunker':'Chunker', 'SFT Generator':'SFT Generator', 'Book Selection':'Book Selection','Review PDF':'Review PDF'};
-  let page = 1, pages = 1, activeView = 'upload', selectedId = null;
-  let listRequest = 0, dashboardBusy = false, listBusy = false, listPending = false;
-  let lastOverview = 0;
-  let searchTimer = null;
-
-  async function json(url) {
-    const response = await fetch(url, {cache:'no-store'});
-    if (!response.ok) throw new Error(`${response.status}: ${await response.text().then(s=>s.slice(0,200))}`);
-    return response.json();
+  const $ = id => document.getElementById(id);
+  const fmt = new Intl.NumberFormat('fa-IR', {maximumFractionDigits: 1});
+  const escapeHTML = v => String(v ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const num = v => v == null ? '—' : fmt.format(Number(v) || 0);
+  const secs = v => v == null || !Number.isFinite(Number(v)) ? '—' :
+    Number(v) < 60 ? `${Number(v).toFixed(1)} ثانیه` : Number(v) < 3600 ? `${(Number(v)/60).toFixed(1)} دقیقه` : `${(Number(v)/3600).toFixed(1)} ساعت`;
+  const when = v => v ? new Date(Number(v) * 1000).toLocaleString('fa-IR') : '—';
+  const labels = {queued:'در صف', starting:'در حال شروع', running:'در حال اجرا', completed:'موفق', failed:'ناموفق', paused:'مکث',
+    pause_requested:'درخواست مکث', resume_requested:'درخواست ادامه', cancel_requested:'درخواست لغو', cancelled:'لغوشده',
+    recovering:'بازیابی', archived:'آرشیو', deleted:'حذف‌شده', interrupted:'وقفه'};
+  const palette = {completed:'#14b8a6',running:'#5675e8',queued:'#f1b55c',failed:'#eb6676',paused:'#a78bfa',cancelled:'#a4adbd',other:'#91a7e9'};
+  let currentView = 'upload', busy = false, cursor = null, history = [], selected = new Set(), selectedJob = null;
+  let currentJobPage = [], previousPages = [], nextPageCursor = null, requestSeq = 0, refreshTimer = null;
+  const alive = () => currentView === 'monitor' && !document.hidden;
+  async function api(path, options={}) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+    try {
+      const opts = {...options, signal: controller.signal, cache:'no-store'};
+      opts.headers = {...(options.headers || {})};
+      if (options.json !== undefined) {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(options.json);
+        delete opts.json;
+      }
+      const response = await fetch(path, opts);
+      const kind = response.headers.get('content-type') || '';
+      const payload = kind.includes('json') ? await response.json() : await response.text();
+      if (!response.ok) {
+        const text = typeof payload === 'object' ? payload.detail || payload.code || JSON.stringify(payload) : payload;
+        throw new Error(`${response.status} — ${String(text).slice(0,180)}`);
+      }
+      return payload;
+    } finally {clearTimeout(timeout);}
   }
-  function empty(text) { return `<div class="chart-empty">${safe(text)}</div>`; }
-  function alertText(message) {
-    el('monitorAlert').textContent = message;
-    el('monitorAlert').classList.toggle('hidden', !message);
+  function note(message='', error=false) {
+    $('monitorAlert').textContent = message;
+    $('monitorAlert').classList.toggle('hidden', !message);
+    $('monitorAlert').classList.toggle('monitor-alert-danger', error);
   }
-  function go(view) {
-    activeView = view;
-    el('uploadView').classList.toggle('hidden', view !== 'upload');
-    el('monitorView').classList.toggle('hidden', view !== 'monitor');
-    document.querySelectorAll('.nav-tab').forEach(tab => {
-      const current = tab.dataset.view === view;
-      tab.classList.toggle('active', current);
-      tab.setAttribute('aria-selected', String(current));
-    });
-    if (view === 'monitor') refresh(true);
-    window.scrollTo({top:0, behavior:'auto'});
-  }
-  document.querySelectorAll('[data-view]').forEach(tab => tab.addEventListener('click', () => { location.hash = tab.dataset.view; }));
-  window.addEventListener('hashchange', () => go(location.hash === '#monitor' ? 'monitor' : 'upload'));
-
-  function setKpis(v) {
-    el('kpiTotal').textContent = number(v.total_jobs);
-    el('kpiActive').textContent = number((v.statuses?.running || 0) + (v.statuses?.queued || 0));
-    el('kpiSuccess').textContent = `${Number(v.job_success_rate || 0).toFixed(1)}%`;
-    el('kpiFailed').textContent = number(v.failed_chunks);
-    el('kpiFailedRate').textContent = `${v.chunk_failure_rate}% از کل چانک‌ها`;
-    el('kpiDuration').textContent = sec(v.duration_sec?.p50);
-    el('kpiP95').textContent = `P95: ${sec(v.duration_sec?.p95)}`;
-    el('kpiPairs').textContent = number(v.selected_pairs);
-    el('kpiGenerated').textContent = `${number(v.generated_pairs)} جفت تولید اولیه`;
-    if (v.indexing) alertText('فهرست تاریخچه در حال ایندکس‌شدن است؛ آمار پس از اتمام دقیق‌تر می‌شود.');
-    else if (v.last_sync_error) alertText(`خطا در به‌روزرسانی تاریخچه: ${v.last_sync_error}`);
-    else alertText('');
-  }
-
-  function dailyChart(days) {
-    const holder = el('dailyChart');
-    const all = (days || []).slice(-32);
-    if (!all.length) { holder.innerHTML = empty('هنوز داده‌ای برای نمودار روزانه وجود ندارد.'); return; }
-    const w=700,h=224,l=35,r=10,t=20,b=48,base=h-b, plot=h-b-t;
-    const ceiling=Math.max(1,...all.map(d=>d.total));
-    const step=(w-l-r)/all.length, bar=Math.min(24,step*.63);
-    const grid=[0,.25,.5,.75,1].map(n=>`<line x1="${l}" y1="${base-plot*n}" x2="${w-r}" y2="${base-plot*n}" stroke="#e9edf4"/><text x="${l-7}" y="${base-plot*n+4}" font-size="11" text-anchor="end" fill="#8c99ab">${Math.round(ceiling*n)}</text>`).join('');
-    const rectangles=all.map((row,i)=>{
-      const x=l+step*i+(step-bar)/2;
-      const success=Math.max(0,Number(row.completed||0)), failed=Math.max(0,Number(row.failed||0)), other=Math.max(0,row.total-success-failed);
-      const scale=plot/ceiling;
-      const pieces=[[success,'#14b8a6'],[failed,'#ed6e77'],[other,'#91a7e9']];
-      let y=base;
-      const bars=pieces.map(([n,color])=> {const height=n*scale;y-=height;return height?`<rect x="${x}" y="${y}" width="${bar}" height="${height}" rx="2" fill="${color}"/>`:'';}).join('');
-      const label=(i===0||i===all.length-1||i%Math.max(1,Math.ceil(all.length/7))===0)?`<text x="${x+bar/2}" y="${base+19}" font-size="11" text-anchor="middle" fill="#64748b">${safe(row.date.slice(5))}</text>`:'';
-      return `<g><title>${safe(row.date)}: ${number(row.total)} Job</title>${bars}${label}</g>`;
+  function placeholder(message) {return `<div class="chart-empty">${escapeHTML(message)}</div>`;}
+  const svgNS='http://www.w3.org/2000/svg';
+  const safePlot = points => points.map(p => Number.isFinite(Number(p)) ? Number(p) : 0);
+  function chartSeries(holderId, points, series, label='') {
+    const holder=$(holderId);
+    if(!points?.length || !series.some(s => safePlot(s.values).some(v => v > 0))) {
+      holder.innerHTML = placeholder('هنوز داده ثبت نشده؛ نمودار مقدار ساختگی نمایش نمی‌دهد.');return;
+    }
+    const W=720,H=242,left=52,right=12,top=20,bottom=52;
+    const max=Math.max(1,...series.flatMap(s => safePlot(s.values)));
+    const px=i=>left + (W-left-right)*(points.length<2 ? .5 : i/(points.length-1));
+    const py=v=>H-bottom-(H-top-bottom)*v/max;
+    const grid=[0,.25,.5,.75,1].map(v=>`<g><line x1="${left}" x2="${W-right}" y1="${py(max*v)}" y2="${py(max*v)}" stroke="#ebeff6"/><text x="${left-8}" y="${py(max*v)+4}" text-anchor="end" fill="#8390a4" font-size="12">${escapeHTML(num(max*v))}</text></g>`).join('');
+    const lines=series.map(s=>{
+      const path=s.values.map((v,i)=>`${i?'L':'M'} ${px(i).toFixed(1)} ${py(Number(v)||0).toFixed(1)}`).join(' ');
+      const dots=s.values.map((v,i)=>`<circle cx="${px(i)}" cy="${py(Number(v)||0)}" r="4" fill="${s.color}"><title>${escapeHTML(s.name)} · ${escapeHTML(new Date(points[i].at*1000).toISOString().slice(0,16))} UTC · ${escapeHTML(num(v))}</title></circle>`).join('');
+      return `<path d="${path}" stroke="${s.color}" stroke-width="2.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/>${dots}`;
     }).join('');
-    holder.innerHTML=`<svg viewBox="0 0 ${w} ${h}" role="img" aria-label="تعداد Jobها به تفکیک روز" class="full-chart" preserveAspectRatio="xMidYMid meet" direction="ltr">${grid}${rectangles}</svg><div class="chart-legend"><span><i style="background:#14b8a6"></i>تکمیل‌شده</span><span><i style="background:#ed6e77"></i>ناموفق</span><span><i style="background:#91a7e9"></i>سایر</span></div>`;
+    const ticks=points.filter((_,i)=>i===0||i===points.length-1||i%Math.max(1,Math.ceil(points.length/6))===0)
+      .map(p=>{const i=points.indexOf(p);return `<text x="${px(i)}" y="${H-22}" text-anchor="middle" font-size="11" fill="#73829a">${escapeHTML(new Date(p.at*1000).toISOString().slice(5,16).replace('T',' '))}</text>`;}).join('');
+    holder.innerHTML = `<svg viewBox="0 0 ${W} ${H}" class="full-chart" role="img" aria-label="${escapeHTML(label)}" direction="ltr">${grid}${lines}${ticks}</svg>
+      <div class="chart-legend">${series.map(s=>`<span><i style="background:${s.color}"></i>${escapeHTML(s.name)}</span>`).join('')}</div>`;
   }
-  function statusChart(statuses) {
-    const holder=el('statusChart'), rows=Object.entries(statuses||{}).filter(([,v])=>Number(v)>0), total=rows.reduce((v,[,n])=>v+n,0);
-    if (!total) {holder.innerHTML=empty('هنوز Jobی ثبت نشده است.');return;}
-    let offset=0;
-    const circles=rows.map(([status,n])=>{
-      const pct=n/total*100;
-      const result=`<circle cx="90" cy="90" r="67" fill="none" stroke="${colors[status]||'#a0a9bd'}" stroke-width="19" stroke-dasharray="${pct} ${100-pct}" stroke-dashoffset="${-offset}" pathLength="100" transform="rotate(-90 90 90)"/>`;
-      offset+=pct;return result;
+  function doughnut(statuses) {
+    const holder=$('statusChart'), pairs=Object.entries(statuses||{}).filter(([,n])=>Number(n)>0);
+    const total=pairs.reduce((a,[,n])=>a+Number(n),0);
+    if(!total){holder.innerHTML=placeholder('هنوز هیچ Jobی ثبت نشده.');return;}
+    let start=0;
+    const circles=pairs.map(([state,count])=>{
+      const pct=100*count/total, color=palette[state]||palette.other;
+      const html=`<circle cx="85" cy="85" r="62" fill="none" stroke="${color}" stroke-width="18" stroke-dasharray="${pct} ${100-pct}" stroke-dashoffset="${-start}" pathLength="100" transform="rotate(-90 85 85)"/>`;
+      start+=pct;return html;
     }).join('');
-    holder.innerHTML=`<div class="donut-layout"><svg viewBox="0 0 180 180" role="img" aria-label="توزیع وضعیت Jobها">${circles}<text x="90" y="85" text-anchor="middle" class="donut-number">${total}</text><text x="90" y="106" text-anchor="middle" class="donut-sub">Job</text></svg><div class="donut-legend">${rows.map(([k,n])=>`<div><span><i style="background:${colors[k]||'#a0a9bd'}"></i>${safe(STATUS[k]||k)}</span><strong>${number(n)}</strong></div>`).join('')}</div></div>`;
+    holder.innerHTML=`<div class="donut-layout"><svg viewBox="0 0 170 170" role="img" aria-label="توزیع وضعیت‌ها">${circles}<text x="85" y="84" text-anchor="middle" class="donut-number">${escapeHTML(num(total))}</text><text x="85" y="103" text-anchor="middle" class="donut-sub">Job</text></svg>
+      <div class="donut-legend">${pairs.map(([state,n])=>`<div><span><i style="background:${palette[state]||palette.other}"></i>${escapeHTML(labels[state]||state)}</span><strong>${num(n)}</strong></div>`).join('')}</div></div>`;
   }
-  function serviceChart(services) {
-    const holder=el('serviceChart');
-    if (!services?.length) {holder.innerHTML=empty('پس از پایان مراحل، زمان اجرای سرویس‌ها نمایش داده می‌شود.');return;}
-    const max=Math.max(1,...services.map(s=>Number(s.p95_sec||s.avg_sec||0)));
-    holder.innerHTML=`<div class="latency-rows">${services.map(row=>{
-      const avg=Number(row.avg_sec||0),p95=Number(row.p95_sec||0);
-      return `<div class="latency-item"><div class="latency-label"><strong>${safe(groupName[row.name]||row.name)}</strong><span>${number(row.jobs)} Job · ${number(row.states?.failed||0)} خطا · میانگین ${sec(avg)} / P95 ${sec(p95)}</span></div><div class="latency-track" dir="ltr"><div class="latency-p95" style="width:${Math.max(1,p95/max*100)}%"></div><div class="latency-mean" style="width:${Math.max(1,avg/max*100)}%"></div></div></div>`;
-    }).join('')}</div><div class="chart-legend"><span><i style="background:#4976ef"></i>میانگین</span><span><i style="background:#c8d6fe"></i>P95</span></div>`;
+  function rejects(rows) {
+    const holder=$('rejectChart');
+    if(!rows?.length){holder.innerHTML=placeholder('هنوز Reject ثبت نشده.');return;}
+    const max=Math.max(1,...rows.map(r=>r.count));
+    holder.innerHTML=`<div class="error-chart">${rows.slice(0,8).map((r,i)=>`<div><div class="error-chart-label"><strong title="${escapeHTML(r.reason)}">${escapeHTML(r.reason)}</strong><span>${num(r.count)}</span></div><div class="error-chart-track"><div style="width:${100*r.count/max}%;background:${i?'#6b90e7':'#e77681'}"></div></div></div>`).join('')}</div>`;
   }
-  function errorChart(errors) {
-    const holder=el('errorChart');
-    if (!errors?.length) {holder.innerHTML=empty('خطای سطح Job در این بازه ثبت نشده است.');return;}
-    const peak=Math.max(...errors.map(x=>x.count),1);
-    holder.innerHTML=`<div class="error-chart">${errors.slice(0,6).map((item,i)=>`<div><div class="error-chart-label"><strong title="${safe(item.code)}">${safe(item.code)}</strong><span>${number(item.count)}</span></div><div class="error-chart-track"><div style="width:${item.count/peak*100}%;background:${i?'#9bafd8':'#ed6e77'}"></div></div></div>`).join('')}</div>`;
+  async function loadOverview(){
+    const data=await api('/v1/ops/overview');
+    const states=data.statuses||{}, parts=data.chunks||{};
+    $('kpiBooks').textContent=num(data.books);
+    $('kpiActive').textContent=num((states.queued||0)+(states.running||0)+(states.starting||0));
+    $('kpiActiveSub').textContent=`در صف ${num(states.queued||0)} · مکث ${num(states.paused||0)}`;
+    $('kpiSuccess').textContent=`${num(states.completed||0)} / ${num(states.failed||0)}`;
+    $('kpiChunks').textContent=num(Object.values(parts).reduce((a,v)=>a+v,0));
+    $('kpiChunksSub').textContent=`موفق ${num(parts.completed||0)} · ناموفق ${num(parts.failed||0)}`;
+    const eta=data.eta||{};
+    $('kpiEta').textContent=secs(eta.eta_seconds);
+    doughnut(states);
   }
-  async function loadHealth() {
-    const target=el('serviceHealth');
-    try {
-      const response=await fetch('/ready',{cache:'no-store'});
-      const data=await response.json();
-      const labels={chunker:'Chunker / OCR',sft_orchestrator:'SFT Orchestrator',sft_generator:'SFT Generator'};
-      target.innerHTML=Object.entries(labels).map(([name,title])=>{
-        const health=data.services?.[name]||{};
-        return `<div class="service-health"><span class="${health.ok?'ok':'down'} indicator"></span><div><strong>${title}</strong><small>${health.ok?'API در دسترس':`API در دسترس نیست · ${safe(health.status_code||health.error||'Unknown')}`}</small></div></div>`;
-      }).join('');
-    } catch(error) {target.innerHTML=empty(`بررسی وضعیت سرویس‌ها ناموفق بود: ${error.message}`);}
+  async function loadAnalytics(){
+    const until=Date.now()/1000, days=Number($('monitorDays').value);
+    const data=await api(`/v1/ops/analytics?since=${until-days*86400}&until=${until}&max_points=120`);
+    const points=data.points||[], books=data.book_points||[];
+    chartSeries('pairsChart',points,[{name:'تولید اولیه',values:points.map(p=>p.generated),color:'#5478df'},{name:'قبول کیفیت',values:points.map(p=>p.accepted),color:'#14b8a6'}],'Generated / quality pass');
+    chartSeries('bookChart',books,[{name:'تکمیل',values:books.map(p=>p.completed),color:'#14b8a6'},{name:'شکست',values:books.map(p=>p.failed),color:'#e97783'}],'Book completions');
+    chartSeries('retryChart',points,[{name:'خطا',values:points.map(p=>p.errors),color:'#e97783'},{name:'تلاش مجدد',values:points.map(p=>p.retries),color:'#f0b759'}],'Errors / retries');
+    chartSeries('durationChart',points,[{name:'میانگین ثانیه / تلاش',values:points.map(p=>p.calls?p.duration_sum/p.calls:0),color:'#6689e5'}],'Mean SFT attempt seconds');
+    rejects(data.rejections);
+    const qualityPoints=points.filter(p=>Number(p.quality_count)>0);
+    chartSeries('qualityChart',qualityPoints,[{name:'میانگین امتیاز ثبت‌شده',values:qualityPoints.map(p=>p.quality_sum/p.quality_count),color:'#8a71dc'}],'Recorded average quality');
+    const generated=points.reduce((a,p)=>a+(Number(p.generated)||0),0), accepted=points.reduce((a,p)=>a+(Number(p.accepted)||0),0);
+    $('kpiPairs').textContent=num(accepted);
+    $('kpiPairsSub').textContent=`Quality pass ${num(accepted)} / Generated ${num(generated)} · ${days} روز`;
   }
-  function internalChart(timings) {
-    const holder=el('internalChart');
-    const rows=Object.entries(timings||{}).filter(([,v])=>Number(v)>0).sort((a,b)=>b[1]-a[1]).slice(0,9);
-    if(!rows.length){holder.innerHTML=empty('هنوز داده‌ای از زمان زیرسرویس‌ها ثبت نشده است.');return;}
-    const max=Math.max(...rows.map(([,n])=>n),1);
-    holder.innerHTML=`<div class="internal-chart">${rows.map(([name,seconds])=>`
-      <div class="internal-chart-item"><span class="internal-chart-label" title="${safe(name)}">${safe(typeof timingName==='function'?timingName(name):name)}</span><div class="internal-chart-track" dir="ltr"><div style="width:${100*seconds/max}%"></div></div><strong>${sec(seconds)}</strong></div>`).join('')}</div>`;
+  async function loadHealth(){
+    const data=await api('/v1/ops/services');
+    const checks=data.services||[];
+    $('serviceHealth').innerHTML=checks.map(r=>`<div class="service-health"><span class="indicator ${r.health==='healthy'?'ok':'down'}"></span><div><strong>${escapeHTML(r.name)}</strong><small>${escapeHTML(r.health)} · ${r.probe_latency_sec==null?'latency —':secs(r.probe_latency_sec)}</small></div></div>`).join('')||placeholder('اطلاعات سرویس در دسترس نیست.');
+    $('workerHealth').innerHTML=`<div class="health-summary">Book slots: ${num(data.active_book_slots||0)} · Workerهای گزارش‌شده: ${num((data.workers||[]).length)} (نمایش حداکثر ۲۰۰)</div>`
+      +(data.workers||[]).slice(0,12).map(w=>`<div class="service-health"><span class="indicator ${w.health==='healthy'?'ok':'down'}"></span><div><strong>${escapeHTML(w.kind)} · ${escapeHTML(w.id)}</strong><small>${escapeHTML(w.health)} · capacity ${num(w.capacity)} · ${when(w.heartbeat)}</small></div></div>`).join('');
+    traceTemplate = data.trace_url_template || '';
+    const trace=data.telemetry||{};
+    $('observabilityStatus').textContent=`Tracing: ${trace.enabled?'فعال':'غیرفعال'}${trace.error?' · '+trace.error:''} · Langfuse برای مشاهده Trace نیاز به راه‌اندازی و تنظیم مستقل دارد.`;
   }
-  async function loadOverview(force=false) {
-    if (dashboardBusy || (!force && Date.now()-lastOverview<30000)) return;
-    dashboardBusy=true;
-    try {
-      const data=await json(`/v1/monitoring/overview?days=${el('monitorDays').value}`);
-      setKpis(data);dailyChart(data.daily);statusChart(data.statuses);serviceChart(data.services);errorChart(data.errors);internalChart(data.internal_timings_sum_sec);
-      el('monitorUpdated').textContent=`آخرین بار: ${new Date().toLocaleTimeString('fa-IR')}`;
-      lastOverview=Date.now();
-    } catch(error) {alertText('دریافت شاخص‌ها ناموفق بود: '+error.message);}
-    finally {dashboardBusy=false;}
+  const filterKey = () => `${$('historySearch').value.trim()}|${$('historyStatus').value}|${$('historyPageSize').value}`;
+  function resetHistory(){cursor=null;previousPages=[];nextPageCursor=null;selected.clear();updateSelected();}
+  function updateSelected(){ $('selectedCount').textContent=`${num(selected.size)} انتخاب`; }
+  async function loadJobs(){
+    const seq=++requestSeq;
+    const query=new URLSearchParams({limit:$('historyPageSize').value});
+    if($('historySearch').value.trim())query.set('q',$('historySearch').value.trim());
+    if($('historyStatus').value)query.set('status',$('historyStatus').value);
+    if(cursor)query.set('cursor',cursor);
+    const data=await api('/v1/ops/jobs?'+query.toString());
+    if(seq!==requestSeq)return;
+    currentJobPage=data.items||[];nextPageCursor=data.next_cursor;
+    const rows=$('historyRows');
+    rows.innerHTML=currentJobPage.map(j=>`<tr>
+      <td><input type="checkbox" data-pick="${escapeHTML(j.id)}" ${selected.has(j.id)?'checked':''} aria-label="انتخاب Job"></td>
+      <td><strong class="book-name">${escapeHTML(j.title||'بدون عنوان')}</strong><small class="mono">${escapeHTML(j.book_id)}</small></td>
+      <td><span class="status-tag status-${escapeHTML(j.status)}"><i></i>${escapeHTML(labels[j.status]||j.status)}</span></td>
+      <td><small>${when(j.updated)}</small></td><td>${num(j.attempt)}</td>
+      <td><code class="mono">${escapeHTML(j.id.slice(0,8))}…</code></td>
+      <td><button type="button" class="ghost-btn table-action" data-open="${escapeHTML(j.id)}">جزئیات ←</button></td></tr>`).join('')||'<tr><td colspan="7" class="empty-state">کتابی با این فیلتر پیدا نشد.</td></tr>';
+    $('historyPrev').disabled=previousPages.length===0;
+    $('historyNext').disabled=!nextPageCursor;
+    $('historyPage').textContent=`صفحه ${num(previousPages.length+1)} · ${num(currentJobPage.length)} ردیف`;
   }
-  function historyQuery() {
-    const fields={q:el('historySearch').value.trim(),status:el('historyStatus').value,
-      input_type:el('historyInput').value,stage:el('historyStage').value,
-      since:el('historySince').value ? el('historySince').value+'T00:00:00' : '',
-      until:el('historyUntil').value ? el('historyUntil').value+'T23:59:59.999999' : '',
-      sort:el('historySort').value,
-      page, page_size:el('historyPageSize').value};
-    return new URLSearchParams(fields).toString();
+  const readableJSON = text => {if (typeof text === 'string') {try{return JSON.parse(text);}catch{return text;}}return text;};
+  const facts = data => Object.entries(data||{}).map(([key,v])=>`<div class="field-row"><span>${escapeHTML(key)}</span><strong>${escapeHTML(v==null?'—':typeof v==='object'?JSON.stringify(v).slice(0,200):v)}</strong></div>`).join('');
+  async function pagedDetail(path, cursor=null){
+    const qs = new URLSearchParams({limit:'50'});
+    if(cursor)qs.set('cursor',cursor);
+    return api(path+'?'+qs.toString());
   }
-  async function loadJobs() {
-    if (listBusy) { listPending=true; return; }
-    const current=++listRequest;
-    listBusy=true;
-    try {
-      const data=await json(`/v1/monitoring/jobs?${historyQuery()}`);
-      if (current!==listRequest) return;
-      pages=Math.max(1,data.pages);
-      el('historyCount').textContent=number(data.total);
-      el('historyRows').innerHTML=(data.items||[]).map(row=>{
-        const status=row.status||'unknown',pct=Math.max(0,Math.min(100,Number(row.progress||0)));
-        return `<tr data-job-id="${safe(row.job_id)}" tabindex="0" role="button" aria-label="جزئیات ${safe(row.book_title||row.filename)}">
-        <td><strong class="book-name">${safe(row.book_title||row.filename||'بدون عنوان')}${row.artifacts_present===0?' <span class="archive-flag" title="فایل‌های اصلی پاک‌سازی شده‌اند">آرشیوی</span>':''}</strong><small class="mono job-short" title="${safe(row.job_id)}">${safe(row.job_id.slice(0,12))}… · ${row.input_type==='ocr_json'?'OCR JSON':'PDF'}</small></td>
-        <td><span class="status-tag status-${safe(status)}"><i></i>${safe(STATUS[status]||status)}</span></td>
-        <td class="stage-cell">${safe(stages[row.stage]||row.stage||'—')}</td>
-        <td><div class="row-progress" dir="ltr"><div style="width:${pct}%"></div></div><small>${pct.toFixed(1)}%</small></td>
-        <td><strong>${number(row.chunk_count)}</strong><small class="${row.failed_chunks?'red-text':'muted'}">${number(row.failed_chunks)} ناموفق</small></td>
-        <td dir="ltr" class="mono">${sec(row.duration_sec ?? (['running','queued'].includes(status)?null:0))}</td>
-        <td class="mono time-cell">${date(row.created_at)}</td>
-        <td class="open-arrow">←</td></tr>`;
-      }).join('')||'<tr><td colspan="8" class="empty-state">Job مطابق فیلترهای انتخاب‌شده پیدا نشد.</td></tr>';
-      const from=data.total?(page-1)*data.page_size+1:0, to=Math.min(data.total,page*data.page_size);
-      el('historyRange').textContent=`نمایش ${number(from)} تا ${number(to)} از ${number(data.total)} Job`;
-      el('historyPage').textContent=`${number(page)} / ${number(pages)}`;
-      el('historyPrev').disabled=page<=1;
-      el('historyNext').disabled=page>=pages;
-    } catch(error) {el('historyRows').innerHTML=`<tr><td colspan="8" class="empty-state">خطا در دریافت تاریخچه: ${safe(error.message)}</td></tr>`;}
-    finally {listBusy=false;if(listPending){listPending=false;loadJobs();}}
-  }
-  async function refresh(force=false) {
-    if(activeView!=='monitor')return;
-    await Promise.all([loadOverview(force),loadJobs(),loadHealth()]);
-    if(selectedId) openJob(selectedId,true);
-  }
-  function bindSelect(id) {el(id).addEventListener('change',()=>{page=1;loadJobs();});}
-  for(const id of ['historyStatus','historyInput','historyStage','historySince','historyUntil','historySort','historyPageSize']) bindSelect(id);
-  el('historySearch').addEventListener('input',()=>{
-    clearTimeout(searchTimer);
-    searchTimer=setTimeout(()=>{page=1;loadJobs();},330);
-  });
-  el('monitorDays').addEventListener('change',()=>{lastOverview=0;loadOverview(true);});
-  el('monitorRefresh').addEventListener('click',()=>{lastOverview=0;refresh(true);});
-  el('historyPrev').addEventListener('click',()=>{if(page>1){page--;loadJobs();}});
-  el('historyNext').addEventListener('click',()=>{if(page<pages){page++;loadJobs();}});
-  el('historyRows').addEventListener('click',event=>{const row=event.target.closest('tr[data-job-id]');if(row)openJob(row.dataset.jobId);});
-  el('historyRows').addEventListener('keydown',event=>{if(event.key==='Enter'){const row=event.target.closest('tr[data-job-id]');if(row)openJob(row.dataset.jobId);}});
-
-  function phaseTimeline(timings) {
-    const rows=Object.entries(timings||{}).filter(([,t])=>t&&t.status!=='waiting');
-    if(!rows.length)return empty('زمان‌بندی مراحل هنوز ثبت نشده است.');
-    const total=Math.max(1, rows.reduce((sum,[,t])=>sum+Number(t.elapsed_sec||0),0));
-    return `<div class="detail-timing">${rows.map(([name,t])=>{
-      const elapsed=Number(t.elapsed_sec||0),skip=t.status==='skipped';
-      return `<div class="detail-timing-row"><div class="detail-step"><span class="phase-dot phase-${safe(t.status||'waiting')}"></span><strong>${safe(stages[name]||name)}</strong><span class="step-status">${safe(t.status)}</span></div><div class="detail-duration"><div class="detail-track"><div style="width:${skip?0:Math.max(1,100*elapsed/total)}%"></div></div><span>${skip?'SKIP':sec(elapsed)}</span></div></div>`;
+  function detailsRows(rows, type){
+    if(!rows?.length)return placeholder('موردی ثبت نشده است.');
+    return `<div class="detail-records">${rows.map(row=>{
+      const label = type==='chunks'?`Chunk #${row.ordinal} · ${row.id}`:type==='events'?`رویداد ${row.kind}`:type==='attempts'?`تلاش #${row.number} · ${row.chunk_id}`:`Artifact ${row.category}`;
+      const sub=type==='events'?when(row.at):type==='attempts'?when(row.started):type==='artifacts'?`${num(row.size)} B`:`${row.status||'—'}`;
+      return `<details class="detail-record"><summary>${escapeHTML(label)} <small>${escapeHTML(sub)}</small></summary><div class="record-grid">${facts(Object.fromEntries(Object.entries(row).filter(([k])=>!['detail','config','error','input_ref','output_ref'].includes(k))))}</div>
+        ${row.trace_id?traceLink(row.trace_id):''}
+        ${row.input_ref?`<p class="mono detail-ref">Input ref: ${escapeHTML(row.input_ref)}</p>`:''}
+        ${row.output_ref?`<p class="mono detail-ref">Output ref: ${escapeHTML(row.output_ref)}</p>`:''}
+        ${row.error?`<pre class="monitor-error">${escapeHTML(readableJSON(row.error) instanceof Object?JSON.stringify(readableJSON(row.error),null,2):row.error)}</pre>`:''}
+        ${row.detail?`<pre class="detail-json">${escapeHTML(JSON.stringify(readableJSON(row.detail),null,2))}</pre>`:''}
+        ${type==='artifacts'&&row.status==='available'?`<a class="small-download" href="/v1/ops/artifacts/${encodeURIComponent(row.id)}">دریافت Artifact ↓</a>`:''}</details>`;
     }).join('')}</div>`;
   }
-  function detailMetrics(job,summary) {
-    const sft=job.metrics?.pipeline?.sft||{},chunker=job.metrics?.pipeline?.chunker||{};
-    const internal=summary?.internal_timings_sum_sec||sft.timings_sum_sec||{};
-    const internalRows=Object.entries(internal).filter(([,n])=>Number(n)>0).sort((a,b)=>b[1]-a[1]).slice(0,18);
-    return `<div class="drawer-metrics"><div><span>چانک‌ها</span><strong>${number(sft.total_chunks||chunker.chunk_count||0)}</strong></div><div><span>چانک‌های پردازش‌شده</span><strong>${number(sft.completed_chunks||0)}</strong></div><div><span>چانک ناموفق</span><strong class="red-text">${number(sft.failed_chunks||0)}</strong></div><div><span>جفت نهایی</span><strong>${number(sft.selected_pairs||0)}</strong></div></div>
-    <h3>زمان زیرسرویس‌های SFT <small>(جمع زمان‌ها روی چانک‌ها؛ قابل جمع با زمان دیواری نیست)</small></h3>
-    ${internalRows.length?`<div class="internal-list">${internalRows.map(([name,t])=>`<div><span title="${safe(name)}">${safe(typeof timingName==='function'?timingName(name):name)}</span><strong>${sec(t)}</strong></div>`).join('')}</div>`:empty('هنوز تله‌متری زیرسرویس‌ها ذخیره نشده است.')}`;
+  let traceTemplate='';
+  function traceLink(id){
+    if(!traceTemplate)return `<small class="muted">Trace ID: ${escapeHTML(id)} · لینک Langfuse هنوز تنظیم نشده</small>`;
+    const href=traceTemplate.replace('{trace_id}',encodeURIComponent(id));
+    if(!/^https:\/\//i.test(href))return '';
+    return `<a class="small-download" href="${escapeHTML(href)}" target="_blank" rel="noopener noreferrer">مشاهده در Langfuse ↗</a>`;
   }
-  function detailDownloads(downloads) {
-    const labels={'chunks.jsonl':'Chunks JSONL','ocr.json':'OCR JSON','chunker.log':'Chunker log',
-      'sft_pairs.jsonl':'Final SFT JSONL','sft_axolotl.jsonl':'Axolotl JSONL','sft_errors.jsonl':'SFT errors',
-      'sft_raw_results.jsonl':'SFT raw results','sft_metrics.json':'SFT metrics',
-      'review_selected.pdf':'Review PDF','review_all_evaluated.pdf':'Audit PDF',
-      'all_evaluated_pairs.jsonl':'All evaluated pairs'};
-    const keys=Object.keys(downloads||{}).filter(key=>labels[key]);
-    return keys.length?`<div class="drawer-downloads">${keys.map(key=>`<a class="small-download" href="${safe(downloads[key])}" download>${safe(labels[key])} ↙</a>`).join('')}</div>`:empty('هنوز فایلی برای دریافت وجود ندارد.');
-  }
-  async function openJob(jobId,quiet=false) {
-    selectedId=jobId;
-    if(!quiet){el('jobDrawer').classList.remove('hidden');document.body.classList.add('drawer-open');el('drawerBody').innerHTML=empty('در حال دریافت جزئیات Job…');}
+  async function openJob(id){
+    selectedJob=id;
+    $('jobDrawer').classList.remove('hidden');document.body.classList.add('drawer-open');
+    $('drawerBody').innerHTML=placeholder('در حال بارگذاری جزئیات…');
     try {
-      const [data,errors]=await Promise.all([
-        json(`/v1/monitoring/jobs/${encodeURIComponent(jobId)}`),
-        json(`/v1/monitoring/jobs/${encodeURIComponent(jobId)}/errors?limit=12`).catch(()=>({available:false,examples:[]}))
-      ]);
-      if(selectedId!==jobId)return;
-      const job=data.job,summary=data.summary||{},status=summary.status||job.status;
-      el('drawerTitle').textContent=job.book_title||job.filename||'Job';
-      el('drawerId').textContent=jobId;
-      const running=['running','queued'].includes(status), duration=running?liveElapsed(job.started_at,job.completed_at,job.total_elapsed_sec):job.total_elapsed_sec;
-      const messages=(errors.common_messages||[]).slice(0,5);
-      const errorHtml=errors.available?
-        `<div class="error-summary"><h3>SFT Request Failures <span class="small-count">${number(errors.sampled)}</span></h3>
-        ${errors.diagnosis?`<div class="diagnosis"><strong>${safe(errors.diagnosis.code)}</strong><span>${safe(errors.diagnosis.hint)}</span></div>`:''}
-        <div class="error-codes">${(errors.http_statuses||[]).map(c=>`<span>${safe(c.code)} × ${number(c.count)}</span>`).join('')}</div>
-        ${messages.map(m=>`<div class="issue-item"><span class="issue-count">${number(m.count)}×</span><code dir="ltr">${safe(m.message)}</code></div>`).join('')}
-        ${errors.examples?.length?`<details><summary>نمونه خطاها بر اساس چانک</summary>${errors.examples.map(e=>`<div class="error-example"><strong>${safe(e.chunk_id||e.chunk_index||'?')}</strong><span>${safe(e.http_status)} · ${sec(e.elapsed_sec)}</span><code dir="ltr">${safe(e.message)}</code></div>`).join('')}</details>`:''}</div>`:
-        empty('فایل SFT Errors برای این Job موجود نیست.');
-      el('drawerBody').innerHTML=`<div class="drawer-top-status"><span class="status-tag status-${safe(status)}"><i></i>${safe(STATUS[status]||status)}</span><span>${date(job.created_at)}</span></div>
-        <p class="muted detail-message">${safe(job.message||'—')}</p>
-        ${status==='interrupted'?'<p class="monitor-note">این Job پیش از راه‌اندازی فعلی ذخیره شده و کارگر فعالی برای ادامه آن وجود ندارد.</p>':''}
-        ${data.artifacts_present===false?'<p class="monitor-note">فایل‌های Job پاک‌سازی شده‌اند؛ خلاصه، زمان‌ها و آمار در تاریخچه باقی مانده‌اند. دانلود فایل‌ها و جزئیات خام خطا دیگر در دسترس نیست.</p>':''}
-        <div class="drawer-progress-label"><strong>پیشرفت کل Pipeline</strong><strong>${Number(job.progress||0).toFixed(1)}%</strong></div><div class="bar"><div class="bar-fill" style="width:${Math.max(0,Math.min(100,Number(job.progress||0)))}%"></div></div>
-        <div class="drawer-facts"><div><span>کل زمان</span><strong>${sec(duration)}</strong></div><div><span>ETA</span><strong>${running?sec(job.eta_sec):'—'}</strong></div><div><span>نوع فایل</span><strong>${job.input_type==='ocr_json'?'OCR JSON':'PDF'}</strong></div><div><span>مرحله فعلی</span><strong>${safe(stages[job.stage]||job.stage)}</strong></div></div>
-        ${job.error?`<div class="monitor-error"><strong>${safe(job.error.code||'Pipeline Error')}</strong><p>${safe(job.error.details||job.error.message||'')}</p></div>`:''}
-        <div class="detail-section"><h3>نقشه زمان‌بندی مراحل</h3>${phaseTimeline(job.timings||summary.timings)}</div>
-        <div class="detail-section">${detailMetrics(job,summary)}</div>
-        <div class="detail-section">${errorHtml}</div>
-        <div class="detail-section"><h3>فایل‌های خروجی و عیب‌یابی</h3>${detailDownloads(data.downloads)}</div>`;
-    } catch(error) {if(selectedId===jobId)el('drawerBody').innerHTML=empty('دریافت اطلاعات Job ناموفق بود: '+error.message);}
+      const [job,chunks,attempts,events,artifacts] = await Promise.all([
+        api('/v1/ops/jobs/'+encodeURIComponent(id)),
+        pagedDetail(`/v1/ops/jobs/${encodeURIComponent(id)}/chunks`),
+        pagedDetail(`/v1/ops/jobs/${encodeURIComponent(id)}/attempts`),
+        pagedDetail(`/v1/ops/jobs/${encodeURIComponent(id)}/events`),
+        pagedDetail(`/v1/ops/jobs/${encodeURIComponent(id)}/artifacts`)]);
+      if(selectedJob!==id)return;
+      $('drawerTitle').textContent=job.title||'کتاب';$('drawerId').textContent=id;
+      const commandOptions=availableActions(job.status);
+      const stageHtml=(job.stages||[]).map(s=>`<div class="detail-timing-row"><strong>${escapeHTML(s.name)}</strong><span>${escapeHTML(labels[s.status]||s.status)}</span><small>${s.started&&s.ended?secs(s.ended-s.started):'—'}</small></div>`).join('');
+      $('drawerBody').innerHTML=`<div class="drawer-top-status"><span class="status-tag status-${escapeHTML(job.status)}">${escapeHTML(labels[job.status]||job.status)}</span><span>${when(job.updated)}</span></div>
+        <div class="drawer-metrics"><div><span>کتاب</span><strong>${escapeHTML(job.book_id)}</strong></div><div><span>تلاش</span><strong>${num(job.attempt)}</strong></div><div><span>قابل Resume</span><strong>${job.resumable?'بله':'خیر'}</strong></div><div><span>Chunkها</span><strong>${num(Object.values(job.chunks||{}).reduce((a,v)=>a+v,0))}</strong></div></div>
+        <div class="ops-actions">${commandOptions.map(([a,title])=>`<button type="button" class="ghost-btn ${a==='delete'?'danger-btn':''}" data-command="${a}">${title}</button>`).join('')||'<span class="muted">برای این وضعیت عملیاتی وجود ندارد.</span>'}</div>
+        <div id="commandNotice" class="muted mini-explain">عملیات روی صف پایدار ثبت می‌شود؛ تکمیل واقعی با بروزرسانی وضعیت مشخص می‌شود.</div>
+        <h3>مراحل پردازش</h3>${stageHtml||placeholder('هنوز مرحله‌ای ثبت نشده.')}<h3>Chunkها <small>۵۰ رکورد اول</small></h3>
+        <div id="chunkDetails">${detailsRows(chunks.items,'chunks')}</div>${chunks.next_cursor?`<button class="ghost-btn load-detail" data-next="chunks" data-cursor="${escapeHTML(chunks.next_cursor)}">چانک‌های بیشتر</button>`:''}
+        <h3>تلاش‌ها و خطاها <small>۵۰ رکورد اول</small></h3><div id="attemptDetails">${detailsRows(attempts.items,'attempts')}</div>
+        ${attempts.next_cursor?`<button class="ghost-btn load-detail" data-next="attempts" data-cursor="${escapeHTML(attempts.next_cursor)}">تلاش‌های بیشتر</button>`:''}
+        <h3>رویدادها <small>۵۰ رکورد اول</small></h3><div id="eventDetails">${detailsRows(events.items,'events')}</div>
+        ${events.next_cursor?`<button class="ghost-btn load-detail" data-next="events" data-cursor="${escapeHTML(events.next_cursor)}">رویدادهای بیشتر</button>`:''}
+        <h3>فایل‌های خروجی</h3><div id="artifactDetails">${detailsRows(artifacts.items,'artifacts')}</div>
+        ${artifacts.next_cursor?`<button class="ghost-btn load-detail" data-next="artifacts" data-cursor="${escapeHTML(artifacts.next_cursor)}">خروجی‌های بیشتر</button>`:''}`;
+    } catch(e){if(selectedJob===id)$('drawerBody').innerHTML=placeholder('دریافت اطلاعات ناموفق بود: '+e.message);}
   }
-  function closeDrawer() {selectedId=null;el('jobDrawer').classList.add('hidden');document.body.classList.remove('drawer-open');}
-  el('drawerClose').addEventListener('click',closeDrawer);
-  el('drawerBackdrop').addEventListener('click',closeDrawer);
-  document.addEventListener('keydown',event=>{if(event.key==='Escape')closeDrawer();});
-  window.setInterval(()=>{
-    if(activeView==='monitor'&&!document.hidden)refresh(false);
-  },15000);
-  go(location.hash==='#monitor'?'monitor':'upload');
+  const availableActions=status=>{
+    const options=[];
+    if(['queued','running','starting','recovering'].includes(status))options.push(['pause','مکث در نقطه امن']);
+    if(status==='paused')options.push(['resume','ادامه پردازش']);
+    if(['queued','running','paused','recovering','pause_requested','resume_requested'].includes(status))options.push(['cancel','لغو Job']);
+    if(['failed','completed','cancelled'].includes(status))options.push(['retry','تلاش مجدد']);
+    if(['failed','completed','cancelled'].includes(status))options.push(['archive','آرشیو']);
+    if(['failed','completed','cancelled','archived'].includes(status))options.push(['delete','حذف نرم (بدون حذف فایل واقعی)']);
+    return options;
+  };
+  async function command(id, action, payload={}) {
+    if(!confirm(`عملیات «${action}» برای ${id.slice(0,8)} ثبت شود؟\nدرخواست لغو یا مکث ممکن است تا رسیدن به نقطه امن زمان ببرد.`))return;
+    const options={method:action==='delete'?'DELETE':'POST',headers:{'Idempotency-Key':crypto.randomUUID()}};
+    if(action!=='delete')options.json=payload;
+    const result=await api(`/v1/ops/jobs/${encodeURIComponent(id)}${action==='delete'?'':'/'+action}`,options);
+    note(`درخواست ${action} ثبت شد؛ Command ID: ${result.id||result.command_id||'—'}`);
+    await Promise.all([loadJobs(),openJob(id)]);
+  }
+  async function loadMore(button){
+    const key=button.dataset.next, id=selectedJob, cursor=button.dataset.cursor;
+    if(!id)return;
+    button.disabled=true;
+    try{
+      const data=await pagedDetail(`/v1/ops/jobs/${encodeURIComponent(id)}/${key}`,cursor);
+      $(`${key==='chunks'?'chunk':key==='attempts'?'attempt':key==='events'?'event':'artifact'}Details`).insertAdjacentHTML('beforeend',detailsRows(data.items,key));
+      if(data.next_cursor){button.dataset.cursor=data.next_cursor;button.disabled=false;} else button.remove();
+    } catch(e){button.disabled=false;note(e.message,true);}
+  }
+  const retentionLabels={temporary_files:'فایل‌های موقت',job_metadata:'متادیتای Job',chunk_inputs:'ورودی Chunk',chunk_outputs:'خروجی Chunk',task_details:'جزئیات Task',error_logs:'لاگ خطا',monitoring_events:'رویدادهای مانیتورینگ',generated_artifacts:'فایل‌های تولیدشده',completed_datasets:'دیتاست نهایی'};
+  async function loadRetention(){
+    const [p,r]=await Promise.all([api('/v1/admin/retention/policies'),api('/v1/admin/retention/runs?limit=10')]);
+    const known=Object.fromEntries((p.items||[]).map(v=>[v.category,v]));
+    $('retentionRows').innerHTML=Object.entries(retentionLabels).map(([category,title])=>{
+      const row=known[category]||{days:30,enabled:false};
+      return `<div class="retention-row"><span>${escapeHTML(title)}</span><input type="number" min="1" max="36500" value="${row.days}" data-days="${category}" aria-label="روز نگهداری ${escapeHTML(title)}"><label><input type="checkbox" data-enabled="${category}" ${row.enabled?'checked':''}> فعال</label><button class="ghost-btn" data-save="${category}" type="button">ذخیره</button></div>`;
+    }).join('');
+    $('retentionStatus').textContent=`آخرین اجرا: ${(r.items||[]).length?escapeHTML(r.items[0].status)+' · '+when(r.items[0].created):'بدون سابقه'} · پاک‌سازی زمان‌بندی‌شده فقط با فعال‌سازی صریح انجام می‌شود.`;
+  }
+  async function retentionSave(category){
+    const day=document.querySelector(`[data-days="${category}"]`),enabled=document.querySelector(`[data-enabled="${category}"]`);
+    await api('/v1/admin/retention/policies',{method:'PUT',json:{category,days:Number(day.value),enabled:enabled.checked}});
+    note('سیاست ذخیره شد؛ برای Artifactهای جدید اعمال می‌شود.');
+  }
+  async function refresh(force=false){
+    if(!alive()||busy)return;
+    busy=true;
+    try {
+      const tasks=[loadOverview(),loadHealth(),loadJobs()];
+      if(force || !window.__lastAnalytics || Date.now()-window.__lastAnalytics > 60000){tasks.push(loadAnalytics().then(()=>{window.__lastAnalytics=Date.now();}));}
+      const results=await Promise.allSettled(tasks);
+      const failures=results.filter(x=>x.status==='rejected');
+      if(failures.length)note('برخی اطلاعات قابل دریافت نیست: '+failures.map(x=>x.reason.message).join(' | '),true);
+      else note('');
+      $('monitorUpdated').textContent='بروزرسانی '+new Date().toLocaleTimeString('fa-IR');
+    } finally {busy=false;}
+  }
+  function switchView(name){
+    currentView=name;
+    $('uploadView').classList.toggle('hidden',name!=='upload');
+    $('monitorView').classList.toggle('hidden',name!=='monitor');
+    document.querySelectorAll('.nav-tab').forEach(b=>b.classList.toggle('active',b.dataset.view===name));
+    if(name==='monitor'){refresh(true);loadRetention().catch(e=>note('Retention: '+e.message,true));}
+  }
+  document.querySelectorAll('.nav-tab').forEach(b=>b.addEventListener('click',()=>location.hash=b.dataset.view));
+  addEventListener('hashchange',()=>switchView(location.hash==='#monitor'?'monitor':'upload'));
+  $('monitorRefresh').onclick=()=>refresh(true);
+  $('serviceRefresh').onclick=()=>loadHealth().catch(e=>note(e.message,true));
+  $('monitorDays').onchange=()=>{window.__lastAnalytics=0;refresh(true);};
+  $('historySearch').oninput=()=>{clearTimeout(refreshTimer);refreshTimer=setTimeout(()=>{resetHistory();loadJobs().catch(e=>note(e.message,true));},400);};
+  $('historyStatus').onchange=$('historyPageSize').onchange=()=>{resetHistory();loadJobs().catch(e=>note(e.message,true));};
+  $('historyReload').onclick=()=>{resetHistory();loadJobs().catch(e=>note(e.message,true));};
+  $('historyPrev').onclick=()=>{if(!previousPages.length)return;cursor=previousPages.pop();loadJobs().catch(e=>note(e.message,true));};
+  $('historyNext').onclick=()=>{if(!nextPageCursor)return;previousPages.push(cursor);cursor=nextPageCursor;loadJobs().catch(e=>note(e.message,true));};
+  $('historyRows').onclick=e=>{
+    const row=e.target.closest('[data-open]');if(row)openJob(row.dataset.open);
+    const checkbox=e.target.closest('[data-pick]');if(checkbox){checkbox.checked?selected.add(checkbox.dataset.pick):selected.delete(checkbox.dataset.pick);updateSelected();}
+  };
+  $('bulkApply').onclick=async()=>{
+    if(!selected.size){note('ابتدا Jobها را انتخاب کن.');return;}
+    const ids=[...selected],action=$('bulkAction').value;
+    if(!confirm(`${num(ids.length)} Job برای «${action}» انتخاب شد. ادامه؟`))return;
+    try{
+      const result=await api('/v1/ops/bulk',{method:'POST',headers:{'Idempotency-Key':crypto.randomUUID()},json:{job_ids:ids,action}});
+      const counts={};(result.items||[]).forEach(r=>counts[r.status]=(counts[r.status]||0)+1);
+      note('نتیجه: '+Object.entries(counts).map(([s,n])=>`${s} ${num(n)}`).join(' · '));
+      selected.clear();updateSelected();await loadJobs();
+    }catch(e){note(e.message,true);}
+  };
+  $('drawerClose').onclick=$('drawerBackdrop').onclick=()=>{selectedJob=null;$('jobDrawer').classList.add('hidden');document.body.classList.remove('drawer-open');};
+  $('drawerBody').onclick=async e=>{
+    const c=e.target.closest('[data-command]');
+    if(c){c.disabled=true;try{await command(selectedJob,c.dataset.command);}catch(e){note(e.message,true);}finally{c.disabled=false;}return;}
+    const more=e.target.closest('.load-detail');if(more)await loadMore(more);
+  };
+  $('retentionRows').onclick=async e=>{const b=e.target.closest('[data-save]');if(!b)return;b.disabled=true;try{await retentionSave(b.dataset.save);}catch(error){note(error.message,true);}finally{b.disabled=false;}};
+  $('retentionPreview').onclick=async()=>{try{const result=await api('/v1/admin/retention/preview',{method:'POST'});note(`پیش‌نمایش: ${num(result.count)} فایل (${num(result.bytes)} بایت)، حذف انجام نشد.`);}catch(e){note(e.message,true);}};
+  $('retentionDryRun').onclick=async()=>{try{const result=await api('/v1/admin/retention/runs',{method:'POST',json:{dry_run:true}});note(`Dry-run ثبت شد: ${result.run_id}`);}catch(e){note(e.message,true);}};
+  setInterval(()=>{if(alive()&&$('monitorAuto').checked&&!selectedJob)refresh();},15000);
+  switchView(location.hash==='#monitor'?'monitor':'upload');
 })();

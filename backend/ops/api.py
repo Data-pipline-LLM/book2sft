@@ -10,15 +10,9 @@ from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.responses import HTMLResponse, Response, JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from .auth import Auth
 from .store import Store, Conflict, Missing, Forbidden, authorize
 from .retention import Retention
 from .schema import jobs, chunks, attempts, commands, events, artifacts, policies, runs, audit
-
-
-class Login(BaseModel):
-    user: str = Field(min_length=1, max_length=128)
-    password: str = Field(max_length=1024)
 
 
 class CreateJob(BaseModel):
@@ -44,7 +38,6 @@ class Schedule(BaseModel):
 
 def create_app(db, objects, *, workflow_ready=None):
     store = Store(db)
-    auth = Auth(store)
     retention = Retention(store, objects)
 
     @asynccontextmanager
@@ -56,7 +49,7 @@ def create_app(db, objects, *, workflow_ready=None):
             await db.close()
 
     app = FastAPI(title='Book2SFT Operations', lifespan=lifespan)
-    app.state.store, app.state.auth, app.state.retention = store, auth, retention
+    app.state.store, app.state.retention = store, retention
     app.state.workflow_ready = workflow_ready
     # No raw body logging, cookie auth, permissive CORS or embedded credentials.
     @app.middleware('http')
@@ -84,10 +77,14 @@ def create_app(db, objects, *, workflow_ready=None):
     async def invalid(_, exc):
         return JSONResponse(status_code=422, content={'code': 'invalid_request', 'detail': str(exc)})
 
-    async def principal(authorization: str = Header(default='')):
-        if not authorization.startswith('Bearer '):
-            raise HTTPException(401, 'Bearer token required')
-        return await auth.principal(authorization[7:])
+    async def principal():
+        # This service is an explicitly local-only test control plane.
+        # No user accounts or session state. Never publish port 8088 outside
+        # localhost / a private tunnel without adding access protection.
+        import os
+        if os.getenv('OPS_TRUSTED_LOCAL_MODE', 'false').lower() != 'true':
+            raise HTTPException(503, 'Enable OPS_TRUSTED_LOCAL_MODE on private staging only')
+        return {'id': 'local-console', 'role': 'admin'}
 
     async def worker_available():
         probe = app.state.workflow_ready
@@ -118,20 +115,6 @@ def create_app(db, objects, *, workflow_ready=None):
         else:
             await worker_available()
         return {'status': 'ready'}
-
-    @app.post('/v1/auth/login')
-    async def login(body: Login, request: Request):
-        source = request.client.host if request.client else 'unknown'
-        return {'access_token': await auth.login(body.user, body.password, source), 'token_type': 'bearer', 'expires_in': 3600}
-
-    @app.post('/v1/auth/logout')
-    async def logout(p=Depends(principal), authorization: str = Header()):
-        await auth.logout(authorization[7:])
-        return {'status': 'logged_out'}
-
-    @app.get('/v1/auth/me')
-    async def me(p=Depends(principal)):
-        return p
 
     @app.get('/v1/ops/overview')
     async def overview(p=Depends(principal)):

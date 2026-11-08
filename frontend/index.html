@@ -114,58 +114,60 @@
     </section>
     </div>
 
-    <section id="monitorView" class="hidden monitoring-view" aria-label="داشبورد مانیتورینگ">
+    <section id="monitorView" class="hidden monitoring-view" aria-label="مانیتورینگ کتاب‌ها">
       <div class="monitor-title-row">
-        <div><p class="eyebrow monitor-eyebrow">OPERATIONS / OBSERVABILITY</p>
+        <div><p class="eyebrow monitor-eyebrow">OPERATIONS / BOOK2SFT</p>
           <h1>مانیتورینگ پایپلاین</h1>
-          <p class="muted">نمای لحظه‌ای عملیات، تحلیل عملکرد سرویس‌ها و تاریخچه قابل جست‌وجوی تمام کتاب‌ها</p>
+          <p class="muted">همان مرکز کنترل Book2SFT — آمار پایدار، مدیریت کتاب‌ها، بررسی چانک‌ها و ردگیری SFT</p>
         </div>
-        <div class="monitor-controls"><span id="monitorUpdated" class="muted monitor-freshness">—</span><button type="button" id="monitorRefresh" class="ghost-btn">↻ بروزرسانی</button></div>
+        <div class="monitor-controls"><span id="monitorUpdated" class="muted monitor-freshness" aria-live="polite">—</span>
+          <button type="button" id="monitorRefresh" class="ghost-btn">↻ بروزرسانی</button></div>
       </div>
       <div id="monitorAlert" class="monitor-alert hidden" role="status"></div>
-      <div class="monitor-toolbar">
-        <label>بازه زمانی <select id="monitorDays"><option value="7">۷ روز اخیر</option><option value="30" selected>۳۰ روز اخیر</option><option value="90">۹۰ روز اخیر</option><option value="0">کل تاریخچه</option></select></label>
-        <div class="monitor-auto"><span class="pulse-dot"></span> بروزرسانی خودکار هر ۱۵ ثانیه</div>
-      </div>
+      <div class="monitor-toolbar"><label>بازه تحلیل
+        <select id="monitorDays"><option value="1">۲۴ ساعت</option><option value="7" selected>۷ روز</option><option value="30">۳۰ روز</option><option value="90">۹۰ روز</option></select></label>
+        <label class="monitor-auto"><input type="checkbox" id="monitorAuto" checked> تازه‌سازی هر ۱۵ ثانیه</label>
+        <span class="muted mini-explain">نمودارها از Aggregateهای ثبت‌شده؛ بدون بارگذاری کل کتاب‌ها در حافظه</span></div>
       <section class="overview-grid" aria-label="شاخص‌های کلیدی">
-        <article class="kpi"><span>کل Jobها</span><strong id="kpiTotal">—</strong><small>در بازه انتخابی</small></article>
-        <article class="kpi"><span>در حال اجرا / صف</span><strong id="kpiActive">—</strong><small>Jobهای فعال سیستم</small></article>
-        <article class="kpi"><span>نرخ موفقیت Job</span><strong id="kpiSuccess">—</strong><small>فقط Jobهای پایان‌یافته</small></article>
-        <article class="kpi"><span>چانک‌های ناموفق</span><strong id="kpiFailed">—</strong><small id="kpiFailedRate">—</small></article>
-        <article class="kpi"><span>زمان میانه Job</span><strong id="kpiDuration">—</strong><small id="kpiP95">P95: —</small></article>
-        <article class="kpi"><span>جفت‌های SFT نهایی</span><strong id="kpiPairs">—</strong><small id="kpiGenerated">—</small></article>
+        <article class="kpi"><span>کتاب‌ها</span><strong id="kpiBooks">—</strong><small>کل کتاب‌های ثبت‌شده</small></article>
+        <article class="kpi"><span>در صف / اجرا</span><strong id="kpiActive">—</strong><small id="kpiActiveSub">—</small></article>
+        <article class="kpi"><span>موفق / ناموفق</span><strong id="kpiSuccess">—</strong><small>اجراهای پایان‌یافته</small></article>
+        <article class="kpi"><span>Chunkها</span><strong id="kpiChunks">—</strong><small id="kpiChunksSub">—</small></article>
+        <article class="kpi"><span>خروجی SFT</span><strong id="kpiPairs">—</strong><small id="kpiPairsSub">—</small></article>
+        <article class="kpi"><span>زمان باقی‌مانده</span><strong id="kpiEta">—</strong><small>برآورد فقط برای چانک‌های شناخته‌شده</small></article>
       </section>
-      <section class="monitor-analytics-grid">
-        <article class="dashboard-card graph-large"><div class="section-heading"><div><span class="small-label">WORKLOAD</span><h3>روند دریافت و تکمیل Jobها</h3></div><span class="muted">به تفکیک روز ایجاد</span></div><div id="dailyChart" class="chart-holder"></div></article>
-        <article class="dashboard-card graph-small"><div class="section-heading"><div><span class="small-label">JOB STATES</span><h3>توزیع وضعیت‌ها</h3></div></div><div id="statusChart" class="chart-holder"></div></article>
-        <article class="dashboard-card graph-large"><div class="section-heading"><div><span class="small-label">LATENCY</span><h3>زمان پردازش به تفکیک سرویس</h3></div><small>میانگین و P95، برحسب زمان دیواری Job</small></div><div id="serviceChart" class="chart-holder"></div></article>
-        <article class="dashboard-card graph-small"><div class="section-heading"><div><span class="small-label">FAILURE SIGNALS</span><h3>علت شکست Jobها</h3></div></div><div id="errorChart" class="chart-holder"></div></article>
-        <article class="dashboard-card graph-wide"><div class="section-heading"><div><span class="small-label">SFT / SUBSERVICES</span><h3>هزینه تجمعی زیرسرویس‌های Data Generator</h3></div><small>جمع زمان ثبت‌شده روی چانک‌ها؛ شامل هم‌پوشانی پردازش موازی است.</small></div><div id="internalChart" class="chart-holder"></div></article>
+      <section class="monitor-analytics-grid" aria-label="نمودارهای تحلیلی">
+        <article class="dashboard-card graph-large"><div class="section-heading"><div><span class="small-label">THROUGHPUT</span><h3>تولید و پذیرش کیفیت SFT</h3></div><small>جفت در هر بازه · Quality Pass ≠ انتخاب نهایی کتاب</small></div><div id="pairsChart" class="chart-holder" aria-live="polite"></div></article>
+        <article class="dashboard-card graph-small"><div class="section-heading"><div><span class="small-label">LIVE STATUS</span><h3>وضعیت Jobها</h3></div></div><div id="statusChart" class="chart-holder"></div></article>
+        <article class="dashboard-card graph-large"><div class="section-heading"><div><span class="small-label">COMPLETIONS</span><h3>کتاب‌های تکمیل‌شده و شکست‌خورده</h3></div><small>بازه زمانی به UTC</small></div><div id="bookChart" class="chart-holder"></div></article>
+        <article class="dashboard-card graph-small"><div class="section-heading"><div><span class="small-label">REJECTION</span><h3>دلایل رد داده</h3></div></div><div id="rejectChart" class="chart-holder"></div></article>
+        <article class="dashboard-card graph-large"><div class="section-heading"><div><span class="small-label">RELIABILITY</span><h3>خطا و Retry در طول زمان</h3></div><small>تعداد تلاش‌های ثبت‌شده در SFT</small></div><div id="retryChart" class="chart-holder"></div></article>
+        <article class="dashboard-card graph-small"><div class="section-heading"><div><span class="small-label">LATENCY</span><h3>زمان هر تلاش SFT</h3></div><small>میانگین هر بازه؛ نه زمان اجرای کل کتاب</small></div><div id="durationChart" class="chart-holder"></div></article>
+        <article class="dashboard-card graph-wide"><div class="section-heading"><div><span class="small-label">CONTENT QUALITY</span><h3>روند میانگین Quality Score ثبت‌شده</h3></div><small>فقط تلاش‌هایی که واقعاً امتیاز ثبت کرده‌اند؛ بدون تخمین یا داده ساختگی</small></div><div id="qualityChart" class="chart-holder"></div></article>
       </section>
-      <section class="dashboard-card health-card"><div class="section-heading"><div><span class="small-label">DEPENDENCIES</span><h3>وضعیت اتصال سرویس‌ها</h3></div><small>این تست، سلامت API را بررسی می‌کند؛ سلامت LLM پایین‌دستی را تضمین نمی‌کند.</small></div><div id="serviceHealth" class="service-health-grid"></div></section>
-      <section class="dashboard-card history-card">
-        <div class="section-heading"><div><span class="small-label">JOB EXPLORER</span><h2>Job Explorer <span id="historyCount" class="small-count">—</span></h2></div><p class="muted">فیلتر سمت سرور، با قابلیت جست‌وجوی کتاب و شناسه Job</p></div>
+      <section class="dashboard-card health-card"><div class="section-heading"><div><span class="small-label">SERVICE HEALTH</span><h3>سلامت سرویس‌ها و ظرفیت</h3></div><button type="button" class="ghost-btn" id="serviceRefresh">بررسی مجدد</button></div><div id="serviceHealth" class="service-health-grid"></div><div id="workerHealth" class="service-health-grid"></div><p class="muted mini-explain" id="observabilityStatus">Langfuse: —</p></section>
+      <section class="dashboard-card history-card"><div class="section-heading"><div><span class="small-label">JOB EXPLORER</span><h2>کتاب‌ها و Jobها</h2></div><small>صفحه‌بندی و فیلتر روی سرور؛ قابل استفاده برای تاریخچه بسیار بزرگ</small></div>
         <div class="history-filters">
-          <input id="historySearch" type="search" placeholder="جست‌وجوی عنوان، نام فایل یا Job ID..." aria-label="جستجوی Job" />
-          <select id="historyStatus" aria-label="وضعیت"><option value="">همه وضعیت‌ها</option><option value="active">فعال / صف</option><option value="completed">تکمیل‌شده</option><option value="failed">ناموفق</option><option value="interrupted">متوقف‌شده</option><option value="queued">در صف</option><option value="running">در حال اجرا</option></select>
-          <select id="historyInput" aria-label="نوع ورودی"><option value="">همه ورودی‌ها</option><option value="pdf">PDF</option><option value="ocr_json">OCR JSON</option></select>
-          <select id="historyStage" aria-label="مرحله"><option value="">همه مراحل</option><option value="ocr">OCR</option><option value="chunking">Chunking</option><option value="atomizing">Atomizing</option><option value="sft_generation">SFT Generation</option><option value="sft_book_selection">Book Selection</option><option value="review_pdf">Review PDF</option><option value="failed">Failed</option><option value="completed">Completed</option></select>
-          <input id="historySince" type="date" aria-label="از تاریخ" title="تاریخ شروع" />
-          <input id="historyUntil" type="date" aria-label="تا تاریخ" title="تاریخ پایان" />
-          <select id="historySort" aria-label="مرتب‌سازی"><option value="newest">جدیدترین</option><option value="oldest">قدیمی‌ترین</option><option value="slowest">طولانی‌ترین</option><option value="most_failed">بیشترین خطای چانک</option></select>
-          <select id="historyPageSize" aria-label="تعداد ردیف"><option value="25">۲۵ / صفحه</option><option value="50">۵۰ / صفحه</option><option value="100">۱۰۰ / صفحه</option></select>
+          <input id="historySearch" type="search" maxlength="120" placeholder="شناسه Job، شناسه کتاب یا عنوان…" aria-label="جستجوی Job">
+          <select id="historyStatus" aria-label="وضعیت"><option value="">همه وضعیت‌ها</option><option value="queued">در صف</option><option value="running">در حال اجرا</option><option value="paused">مکث</option><option value="pause_requested">در حال توقف</option><option value="resume_requested">در حال ادامه</option><option value="cancel_requested">در حال لغو</option><option value="completed">موفق</option><option value="failed">ناموفق</option><option value="cancelled">لغوشده</option><option value="archived">آرشیو</option></select>
+          <select id="historyPageSize"><option value="25">۲۵ در صفحه</option><option value="50">۵۰ در صفحه</option><option value="100">۱۰۰ در صفحه</option></select>
+          <button type="button" class="ghost-btn" id="historyReload">اعمال فیلتر</button>
         </div>
-        <div class="history-table-wrap"><table class="history-table"><thead><tr><th>کتاب / Job</th><th>وضعیت</th><th>مرحله</th><th>پیشرفت</th><th>چانک / خطا</th><th>مدت</th><th>زمان ایجاد</th><th></th></tr></thead><tbody id="historyRows"><tr><td colspan="8" class="empty-state">در حال بارگذاری…</td></tr></tbody></table></div>
-        <div class="history-footer"><span id="historyRange" class="muted">—</span><div class="pagination"><button type="button" class="ghost-btn" id="historyPrev">قبلی</button><span id="historyPage">۱</span><button type="button" class="ghost-btn" id="historyNext">بعدی</button></div></div>
+        <div class="history-table-wrap"><table class="history-table"><thead><tr><th>انتخاب</th><th>کتاب / Job</th><th>وضعیت</th><th>آخرین بروزرسانی</th><th>تلاش</th><th>شناسه</th><th>عملیات</th></tr></thead><tbody id="historyRows"><tr><td colspan="7" class="empty-state">هنوز داده‌ای دریافت نشده است.</td></tr></tbody></table></div>
+        <div class="history-footer"><div class="bulk-controls"><select id="bulkAction"><option value="pause">مکث انتخاب‌شده‌ها</option><option value="resume">ادامه انتخاب‌شده‌ها</option><option value="cancel">لغو انتخاب‌شده‌ها</option><option value="retry">تلاش مجدد انتخاب‌شده‌ها</option><option value="archive">آرشیو انتخاب‌شده‌ها</option></select><button id="bulkApply" type="button" class="ghost-btn">اعمال گروهی</button><small id="selectedCount" class="muted">۰ انتخاب</small></div>
+          <div class="pagination"><button id="historyPrev" type="button" class="ghost-btn">قبلی</button><span id="historyPage">صفحه ۱</span><button id="historyNext" type="button" class="ghost-btn">بعدی</button></div></div>
+      </section>
+      <section class="dashboard-card retention-card"><div class="section-heading"><div><span class="small-label">DATA LIFECYCLE</span><h3>مدت نگهداری داده‌ها</h3></div><span class="pill">حذف خودکار پیش‌فرض غیرفعال</span></div>
+        <p class="muted">تنظیمات این بخش فقط به داده‌های واجد شرایط اعمال می‌شود. حذف داده‌های موردنیاز Job فعال یا قابل Resume مجاز نیست. هماهنگی پاک‌سازی با Cache پایین‌دستی و Langfuse هنوز باید روی سرور آزموده شود.</p>
+        <div id="retentionRows" class="retention-grid"></div>
+        <div class="retention-actions"><button type="button" class="ghost-btn" id="retentionPreview">پیش‌نمایش حذف (بدون حذف)</button><button type="button" class="ghost-btn" id="retentionDryRun">اجرای آزمایشی Dry-run</button><span class="muted" id="retentionStatus">—</span></div>
       </section>
     </section>
   </main>
   <div id="jobDrawer" class="drawer-overlay hidden" role="dialog" aria-modal="true" aria-label="جزئیات Job">
     <div id="drawerBackdrop" class="drawer-backdrop"></div>
-    <aside class="job-drawer">
-      <div class="drawer-head"><div><p class="small-label">JOB INSPECTOR</p><h2 id="drawerTitle">—</h2><span id="drawerId" class="mono muted"></span></div><button type="button" class="close-drawer" id="drawerClose" aria-label="بستن">×</button></div>
-      <div id="drawerBody" class="drawer-body"><p>در حال دریافت جزئیات…</p></div>
-    </aside>
+    <aside class="job-drawer"><div class="drawer-head"><div><p class="small-label">BOOK / JOB INSPECTOR</p><h2 id="drawerTitle">—</h2><span id="drawerId" class="mono muted"></span></div><button type="button" id="drawerClose" class="close-drawer" aria-label="بستن">×</button></div>
+    <div class="drawer-body" id="drawerBody"></div></aside>
   </div>
   <script src="/static/app.js"></script>
   <script src="/static/monitoring.js"></script>

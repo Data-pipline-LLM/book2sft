@@ -38,9 +38,9 @@ async def jobs_page(store, *, cursor=None, limit=100, q='', status=None, since=N
         query = query.where(jobs.c.created < until)
     if cursor:
         at, jid = unpack(cursor)
-        query = query.where(or_(jobs.c.created > float(at), and_(jobs.c.created == float(at), jobs.c.id > str(jid))))
+        query = query.where(or_(jobs.c.created < float(at), and_(jobs.c.created == float(at), jobs.c.id < str(jid))))
     async with store.db.transaction() as conn:
-        rows = [dict(row) for row in (await conn.execute(query.order_by(jobs.c.created, jobs.c.id).limit(limit + 1))).mappings()]
+        rows = [dict(row) for row in (await conn.execute(query.order_by(jobs.c.created.desc(), jobs.c.id.desc()).limit(limit + 1))).mappings()]
     return {'items': rows[:limit], 'next_cursor': pack([rows[limit-1]['created'], rows[limit-1]['id']]) if len(rows) > limit else None}
 
 

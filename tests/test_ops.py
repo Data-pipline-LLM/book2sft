@@ -9,7 +9,6 @@ from backend.ops.store import Store, Conflict, Forbidden
 from backend.ops.schema import commands, chunks, attempts, jobs, artifacts, runs, audit, users
 from backend.ops.artifacts import LocalArtifacts
 from backend.ops.retention import Retention
-from backend.ops.auth import Auth
 
 
 class OpsCase(unittest.IsolatedAsyncioTestCase):
@@ -227,51 +226,46 @@ class OpsCase(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await self.store.page(jobs, limit=500000)
 
-    async def test_auth_expiry_revocation_role_refresh(self):
-        auth = Auth(self.store)
-        await auth.create_user('admin', 'test password long enough', 'admin', 'bootstrap', 'admin')
-        with self.assertRaises(Forbidden):
-            await auth.login('admin', 'wrong')
-        token = await auth.login('admin', 'test password long enough')
-        self.assertEqual((await auth.principal(token))['role'], 'admin')
-        async with self.db.transaction() as conn:
-            await conn.execute(users.update().where(users.c.id == 'admin').values(role='viewer'))
-        self.assertEqual((await auth.principal(token))['role'], 'viewer')
-        await auth.logout(token)
-        with self.assertRaises(Forbidden):
-            await auth.principal(token)
-        token = await auth.login('admin', 'test password long enough')
-        self.now += 3601
-        with self.assertRaises(Forbidden):
-            await auth.principal(token)
-
     async def test_production_rejects_sqlite(self):
         with self.assertRaises(ValueError):
             Database('sqlite://')
 
-    async def test_api_authorization_and_unavailable_executor(self):
+    async def test_api_original_ui_trusted_mode_without_login_and_unavailable_executor(self):
         import httpx
+        from unittest.mock import patch
         from backend.ops.api import create_app
         app = create_app(self.db, self.objects)
         app.state.store.clock = lambda: self.now
-        await app.state.auth.create_user('viewer', 'viewer password long enough', 'viewer', 'bootstrap', 'admin')
-        await app.state.auth.create_user('operator', 'operator password long enough', 'operator', 'bootstrap', 'admin')
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
-            self.assertEqual((await client.get('/v1/ops/jobs')).status_code, 401)
-            response = await client.post('/v1/auth/login', json={'user': 'viewer', 'password': 'viewer password long enough'})
-            self.assertEqual(response.status_code, 200, response.text)
-            viewer = {'Authorization': 'Bearer ' + response.json()['access_token']}
-            self.assertEqual((await client.get('/v1/ops/overview', headers=viewer)).status_code, 200)
-            self.assertEqual((await client.get('/v1/admin/audit', headers=viewer)).status_code, 403)
-            self.assertEqual((await client.post('/v1/ops/jobs', headers={**viewer, 'Idempotency-Key': 'x'}, json={'title': 'x'})).status_code, 403)
-            response = await client.post('/v1/auth/login', json={'user': 'operator', 'password': 'operator password long enough'})
-            operator = {'Authorization': 'Bearer ' + response.json()['access_token'], 'Idempotency-Key': 'x'}
-            self.assertEqual((await client.post('/v1/ops/jobs', headers=operator, json={'title': 'x'})).status_code, 503)
-            self.assertEqual((await client.get('/ready')).status_code, 503)
-            self.assertEqual((await client.get('/v1/ops/jobs?limit=500000', headers=viewer)).status_code, 422)
-            self.assertEqual((await client.get('/v1/ops/jobs', headers=viewer)).json()['items'], [])
-            await client.post('/v1/auth/logout', headers=viewer)
-            self.assertEqual((await client.get('/v1/ops/overview', headers=viewer)).status_code, 403)
+            with patch.dict(os.environ, {'OPS_TRUSTED_LOCAL_MODE': 'false'}):
+                self.assertEqual((await client.get('/v1/ops/jobs')).status_code, 503)
+            with patch.dict(os.environ, {'OPS_TRUSTED_LOCAL_MODE': 'true'}):
+                home = await client.get('/')
+                self.assertEqual(home.status_code, 200)
+                self.assertIn('مانیتورینگ پایپلاین', home.text)
+                self.assertNotIn('ورود امن', home.text)
+                self.assertEqual((await client.get('/v1/auth/login')).status_code, 404)
+                self.assertEqual((await client.get('/v1/admin/users')).status_code, 404)
+                self.assertEqual((await client.get('/static/monitoring.js')).status_code, 200)
+                self.assertEqual((await client.get('/v1/ops/overview')).status_code, 200)
+                self.assertEqual((await client.get('/v1/ops/jobs?limit=500000')).status_code, 422)
+                self.assertEqual((await client.get('/v1/ops/jobs')).json()['items'], [])
+                self.assertEqual((await client.post('/v1/ops/jobs', headers={'Idempotency-Key': 'x'}, json={'title': 'x'})).status_code, 503)
+                self.assertEqual((await client.get('/ready')).status_code, 503)
+
+    async def test_jobs_page_newest_first_and_cursor(self):
+        from backend.ops.queries import jobs_page
+        first = await self.store.create('first', {}, 'operator', 'operator', 'key1')
+        self.now += 10
+        second = await self.store.create('second', {}, 'operator', 'operator', 'key2')
+        self.now += 10
+        third = await self.store.create('third', {}, 'operator', 'operator', 'key3')
+        page = await jobs_page(self.store, limit=2)
+        self.assertEqual([j['id'] for j in page['items']], [third, second])
+        self.assertIsNotNone(page['next_cursor'])
+        rest = await jobs_page(self.store, cursor=page['next_cursor'], limit=2)
+        self.assertEqual([j['id'] for j in rest['items']], [first])
+        self.assertIsNone(rest['next_cursor'])
 
     async def test_duplicate_publish_hash_conflict(self):
         jid = await self.started()
@@ -279,14 +273,6 @@ class OpsCase(unittest.IsolatedAsyncioTestCase):
         await self.finish(claim)
         with self.assertRaises(Conflict):
             await self.store.finish_chunk(claim['attempt_id'], self.checkpoints[claim['attempt_id']][0], 'b' * 64)
-
-    async def test_login_rate_limit_persists(self):
-        from backend.ops.schema import auth_limits
-        auth = Auth(self.store)
-        async with self.db.transaction() as conn:
-            await conn.execute(auth_limits.insert().values(identity=__import__('hashlib').sha256(b'host').hexdigest(), count=10, reset_at=self.now + 60))
-        with self.assertRaisesRegex(Forbidden, 'rate limit'):
-            await auth.login('missing', 'wrong', source='host')
 
     async def test_cleanup_schedule_durable_disabled_and_no_duplicate(self):
         from backend.ops.cleanup_worker import CleanupWorker

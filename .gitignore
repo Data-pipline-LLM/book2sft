@@ -11,3 +11,7 @@ data/jobs/*
 __pycache__/
 .env.staging
 .env.production
+
+# Runtime snapshots are not source code
+data/monitoring/*.sqlite3*
+*.log

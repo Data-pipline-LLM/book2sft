@@ -11,7 +11,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import select, and_, func
-from .schema import stages, chunks, attempts, artifacts, audit, jobs, events, workers, users, sessions
+from .schema import stages, chunks, attempts, artifacts, jobs, events
 from .queries import job_detail, event_page, pack
 from .analytics import Analytics
 from .store import authorize, Missing, encoded
@@ -28,10 +28,10 @@ def install(app, store, objects, principal, worker_available):
 
     @app.get('/', response_class=HTMLResponse)
     async def dashboard():
-        return (Path(__file__).resolve().parents[2] / 'frontend/ops/index.html').read_text()
-    asset_root = Path(__file__).resolve().parents[2] / 'frontend/ops'
+        return (Path(__file__).resolve().parents[2] / 'frontend/index.html').read_text()
+    asset_root = Path(__file__).resolve().parents[2] / 'frontend'
     if asset_root.exists():
-        app.mount('/ops-static', StaticFiles(directory=asset_root), name='ops-static')
+        app.mount('/static', StaticFiles(directory=asset_root), name='static')
 
     @app.post('/v1/jobs', status_code=202)
     async def compatibility_upload(request: Request, p=Depends(principal)):
@@ -67,7 +67,10 @@ def install(app, store, objects, principal, worker_available):
         original = json.loads(latest).get('job', {}) if latest else {}
         if p['role'] == 'viewer':
             original.pop('error', None)
-        return {**original, 'job_id': jid, **detail}
+        return {**original, 'job_id': jid, 'book_title': detail['title'],
+            'stage': original.get('stage') or ('completed' if detail['status'] == 'completed' else 'queued'),
+            'progress': original.get('progress', 100 if detail['status'] == 'completed' else 0),
+            **detail}
 
     @app.get('/v1/jobs/{jid}/download/{name}')
     async def legacy_download(jid: str, name: str, p=Depends(principal)):
@@ -135,7 +138,10 @@ def install(app, store, objects, principal, worker_available):
     @app.get('/v1/ops/services')
     async def services(p=Depends(principal)):
         urls = {'chunker': os.getenv('CHUNKER_BASE_URL', 'http://chunker:8080'),
-                'sft': os.getenv('SFT_ORCHESTRATOR_BASE_URL', 'http://orchestrator:8000')}
+                'sft_orchestrator': os.getenv('SFT_ORCHESTRATOR_BASE_URL', 'http://orchestrator:8000'),
+                'sft_generator': os.getenv('SFT_GENERATOR_BASE_URL', 'http://generator:8000'),
+                'sft_assessment': os.getenv('SFT_ASSESSMENT_BASE_URL', 'http://assessment:8000'),
+                'sft_quality': os.getenv('SFT_QUALITY_BASE_URL', 'http://quality:8000')}
         async def check(name, url):
             started = time.monotonic()
             try:
@@ -148,6 +154,8 @@ def install(app, store, objects, principal, worker_available):
         fleet = await analytics.fleet()
         fleet['services'] = await asyncio.gather(*(check(name, url) for name, url in urls.items()))
         fleet['telemetry'] = __import__('backend.ops.telemetry', fromlist=['status']).status
+        url_template = os.getenv('LANGFUSE_TRACE_URL_TEMPLATE', '')
+        fleet['trace_url_template'] = url_template if url_template.startswith('https://') and '{trace_id}' in url_template else ''
         return fleet
 
     @app.post('/v1/ops/bulk', status_code=202)
@@ -172,8 +180,3 @@ def install(app, store, objects, principal, worker_available):
                 result.append({'job_id': jid, 'status': 'conflict'})
         return {'items': result}
 
-    @app.get('/v1/admin/users')
-    async def user_list(p=Depends(principal)):
-        authorize(p['role'], 'admin')
-        async with store.db.transaction() as conn:
-            return {'items': [dict(row) for row in (await conn.execute(select(users.c.id, users.c.role, users.c.enabled).limit(200))).mappings()]}

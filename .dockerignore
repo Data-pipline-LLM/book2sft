@@ -11,3 +11,7 @@ data/jobs/*
 
 .env.*
 .aws
+
+# Live observability data must not enter build context
+data/monitoring/
+*.log
