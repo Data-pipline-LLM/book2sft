@@ -1,0 +1,199 @@
+name: book2sft-task2
+x-app-environment: &app-env
+  OPS_DATABASE_URL: postgresql+asyncpg://ops:${OPS_DB_PASSWORD:?Set URL-safe private password}@postgres:5432/book2sft_ops
+  OPS_S3_ENDPOINT: http://minio:9000
+  OPS_S3_BUCKET: book2sft-ops
+  OPS_S3_PUBLIC_ENDPOINT: ${OPS_S3_PUBLIC_ENDPOINT:-}
+  AWS_ACCESS_KEY_ID: ${OPS_S3_USER:?Set private storage user}
+  AWS_SECRET_ACCESS_KEY: ${OPS_S3_PASSWORD:?Set private storage password}
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_EC2_METADATA_DISABLED: 'true'
+  OPS_SERVICE_TOKEN: ${OPS_SERVICE_TOKEN:?Set private service token}
+  TEMPORAL_ADDRESS: temporal:7233
+  TEMPORAL_NAMESPACE: default
+  TEMPORAL_TASK_QUEUE: book2sft-books
+  CHUNKER_BASE_URL: http://chunker:8080
+  SFT_ORCHESTRATOR_BASE_URL: http://orchestrator:8000
+  SFT_GENERATOR_BASE_URL: http://generator:8000
+  JOB_WORKERS: ${JOB_WORKERS:-2}
+  SFT_CONCURRENCY: ${SFT_CONCURRENCY:-4}
+  SFT_PAIR_CONCURRENCY: ${SFT_PAIR_CONCURRENCY:-2}
+  LANGFUSE_ENABLED: ${LANGFUSE_ENABLED:-false}
+  LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+  LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+  LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  TRACE_CAPTURE_CONTENT: ${TRACE_CAPTURE_CONTENT:-false}
+  TRACE_CONTENT_LIMIT: ${TRACE_CONTENT_LIMIT:-16384}
+  LANGFUSE_TRACE_URL_TEMPLATE: ${LANGFUSE_TRACE_URL_TEMPLATE:-}
+x-sft-environment: &sft-env
+  USE_MOCK_MODEL: '0'
+  VLLM_BASE_URL: ${VLLM_BASE_URL:-http://model:8000/v1}
+  VLLM_MODEL_NAME: ${VLLM_MODEL_NAME:-configured-on-server}
+  VLLM_API_KEY: ${VLLM_API_KEY:-}
+  OPS_SERVICE_TOKEN: ${OPS_SERVICE_TOKEN:?Set private service token}
+  OPS_REQUIRE_SERVICE_AUTH: 'true'
+  LANGFUSE_ENABLED: ${LANGFUSE_ENABLED:-false}
+  LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+  LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+  LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  TRACE_CAPTURE_CONTENT: ${TRACE_CAPTURE_CONTENT:-false}
+  TRACE_CONTENT_LIMIT: ${TRACE_CONTENT_LIMIT:-16384}
+services:
+  postgres:
+    image: postgres:16.13-alpine
+    environment: {POSTGRES_USER: ops, POSTGRES_DB: book2sft_ops, POSTGRES_PASSWORD: '${OPS_DB_PASSWORD:?required}'}
+    volumes: [postgres:/var/lib/postgresql/data]
+    healthcheck: {test: ['CMD-SHELL', 'pg_isready -U ops -d book2sft_ops'], interval: 5s, timeout: 3s, retries: 30}
+    restart: unless-stopped
+  temporal-db:
+    image: postgres:16.13-alpine
+    environment: {POSTGRES_USER: temporal, POSTGRES_PASSWORD: '${TEMPORAL_DB_PASSWORD:?required}'}
+    volumes: [temporal-db:/var/lib/postgresql/data]
+    healthcheck: {test: ['CMD-SHELL', 'pg_isready -U temporal'], interval: 5s, timeout: 3s, retries: 30}
+    restart: unless-stopped
+  temporal:
+    image: temporalio/auto-setup:1.29.1
+    environment: {DB: postgres12, DB_PORT: '5432', POSTGRES_USER: temporal, POSTGRES_PWD: '${TEMPORAL_DB_PASSWORD:?required}', POSTGRES_SEEDS: temporal-db}
+    depends_on: {temporal-db: {condition: service_healthy}}
+    restart: unless-stopped
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address :9001
+    environment: {MINIO_ROOT_USER: '${OPS_S3_USER:?required}', MINIO_ROOT_PASSWORD: '${OPS_S3_PASSWORD:?required}'}
+    volumes: [objects:/data]
+    restart: unless-stopped
+  migrate:
+    image: book2sft-operations:task2
+    build: {context: ., dockerfile: Dockerfile.operations}
+    environment: *app-env
+    command: ['python', '-m', 'backend.ops.cli', 'migrate']
+    depends_on: {postgres: {condition: service_healthy}}
+    restart: 'no'
+  storage-init:
+    image: book2sft-operations:task2
+    build: {context: ., dockerfile: Dockerfile.operations}
+    environment: *app-env
+    command: ['python', '-m', 'backend.ops.cli', 'init-storage']
+    depends_on: {minio: {condition: service_started}}
+    restart: 'no'
+  api:
+    image: book2sft-operations:task2
+    build: {context: ., dockerfile: Dockerfile.operations}
+    environment: *app-env
+    ports: ['127.0.0.1:${OPS_HTTP_PORT:-8088}:8088']
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on: {migrate: {condition: service_completed_successfully}, storage-init: {condition: service_completed_successfully}}
+    healthcheck: {test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8088/ready",timeout=3)'], interval: 10s, timeout: 5s, retries: 20}
+    restart: unless-stopped
+  worker:
+    image: book2sft-operations:task2
+    build: {context: ., dockerfile: Dockerfile.operations}
+    environment: *app-env
+    command: ['python', '-m', 'backend.ops.worker']
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck: {test: ['CMD', 'python', '-m', 'backend.ops.cli', 'health', '--kind', 'book-worker'], interval: 15s, timeout: 10s, retries: 5, start_period: 60s}
+    depends_on: {migrate: {condition: service_completed_successfully}, storage-init: {condition: service_completed_successfully}, temporal: {condition: service_started}}
+    restart: unless-stopped
+  cleanup:
+    image: book2sft-operations:task2
+    build: {context: ., dockerfile: Dockerfile.operations}
+    environment: *app-env
+    command: ['python', '-m', 'backend.ops.cleanup_worker']
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck: {test: ['CMD', 'python', '-m', 'backend.ops.cli', 'health', '--kind', 'cleanup'], interval: 15s, timeout: 10s, retries: 5}
+    depends_on: {migrate: {condition: service_completed_successfully}, storage-init: {condition: service_completed_successfully}}
+    restart: unless-stopped
+  chunker:
+    build: {context: ../Chunker_Book, dockerfile: Dockerfile.staging}
+    image: book2sft-chunker:task2
+    environment:
+      OPS_SERVICE_TOKEN: ${OPS_SERVICE_TOKEN:?required}
+      OPS_REQUIRE_SERVICE_AUTH: 'true'
+      OCR_BASE_URL: ${OCR_BASE_URL:-http://ocr:8091}
+      OCR_API_KEY: ${OCR_API_KEY:-}
+      CHUNKER_LLM_URL: ${CHUNKER_LLM_URL:-http://model:8000/v1/chat/completions}
+      CHUNKER_LLM_API_KEY: ${CHUNKER_LLM_API_KEY:-}
+      CHUNKER_LLM_MODEL: ${VLLM_MODEL_NAME:-configured-on-server}
+      CHUNKER_LLM_CONCURRENCY: ${CHUNKER_LLM_CONCURRENCY:-16}
+    volumes: [chunker:/data/jobs]
+    restart: unless-stopped
+  orchestrator:
+    build: {context: ../Data-construction-pipeline, dockerfile: Dockerfile.staging}
+    image: book2sft-sft:task2
+    environment:
+      <<: *sft-env
+      INSTRUCTION_ASSESSMENT_URL: http://assessment:8000
+      GENERATE_INSTRUCTION_URL: http://generator:8000
+      TRANSLATION_URL: ${TRANSLATION_URL:-http://translation:8000}
+      TRANSLATION_EVALUATION_URL: ${TRANSLATION_EVALUATION_URL:-http://quality:8000}
+    volumes: [request-cache:/data/ops-requests]
+    restart: unless-stopped
+  generator:
+    build: {context: ../Data-construction-pipeline, dockerfile: Dockerfile.staging}
+    image: book2sft-sft:task2
+    environment: *sft-env
+    command: ['uvicorn', 'services.generate_instruction.app:app', '--host', '0.0.0.0', '--port', '8000', '--no-access-log']
+    restart: unless-stopped
+  assessment:
+    build: {context: ../Data-construction-pipeline, dockerfile: Dockerfile.staging}
+    image: book2sft-sft:task2
+    environment: *sft-env
+    command: ['uvicorn', 'services.instruction_value_assessment.app:app', '--host', '0.0.0.0', '--port', '8000', '--no-access-log']
+    restart: unless-stopped
+  quality:
+    build: {context: ../Data-construction-pipeline, dockerfile: Dockerfile.staging}
+    image: book2sft-sft:task2
+    environment: *sft-env
+    command: ['uvicorn', 'services.translation_evaluation.app:app', '--host', '0.0.0.0', '--port', '8000', '--no-access-log']
+    restart: unless-stopped
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.123.0
+    profiles: [observability]
+    command: ['--config=/etc/otel/config.yml']
+    configs:
+      - source: otel-config
+        target: /etc/otel/config.yml
+    restart: unless-stopped
+volumes:
+  postgres:
+  temporal-db:
+  objects:
+  chunker:
+  request-cache:
+
+configs:
+  otel-config:
+    content: |
+      receivers:
+        otlp:
+          protocols:
+            http:
+              endpoint: 0.0.0.0:4318
+      processors:
+        memory_limiter:
+          check_interval: 1s
+          limit_mib: 128
+          spike_limit_mib: 32
+        batch:
+          send_batch_size: 64
+          timeout: 1s
+      exporters:
+        debug:
+          verbosity: basic
+      service:
+        pipelines:
+          traces:
+            receivers: [otlp]
+            processors: [memory_limiter, batch]
+            exporters: [debug]

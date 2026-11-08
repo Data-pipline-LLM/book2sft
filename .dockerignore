@@ -8,3 +8,6 @@ __pycache__/
 venv/
 data/jobs/*
 !data/jobs/.gitkeep
+
+.env.*
+.aws

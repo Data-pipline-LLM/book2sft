@@ -4,3 +4,10 @@ __pycache__/
 .venv/
 data/jobs/*
 !data/jobs/.gitkeep
+
+# Task 2 local secrets and private metadata backups
+.env.task2
+*.ops-backup.jsonl
+__pycache__/
+.env.staging
+.env.production

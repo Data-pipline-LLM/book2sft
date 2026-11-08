@@ -1,0 +1,5 @@
+# Additive dependencies. These exact versions are present in base_env.
+# Existing FastAPI/Pydantic packages are not downgraded or broadly upgraded.
+SQLAlchemy==2.0.53
+asyncpg==0.31.0
+boto3==1.43.36

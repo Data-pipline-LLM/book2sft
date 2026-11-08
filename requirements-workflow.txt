@@ -1,0 +1,5 @@
+-r requirements-ops.txt
+# MIT; Python >=3.9. Version existence checked against the official PyPI release.
+temporalio==1.17.0
+opentelemetry-sdk==1.38.0
+opentelemetry-exporter-otlp-proto-http==1.38.0

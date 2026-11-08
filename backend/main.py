@@ -294,6 +294,14 @@ class JobState:
 
 
 class JobManager:
+    resume_children = False
+
+    def sft_request_headers(self, job, index):
+        return {'X-Service-Token': os.getenv('OPS_SERVICE_TOKEN', '')}
+
+    def chunker_request_headers(self, job):
+        return {'X-Service-Token': os.getenv('OPS_SERVICE_TOKEN', '')}
+
     def __init__(self) -> None:
         self.jobs: dict[str, JobState] = {}
         self.queue: asyncio.Queue[str] = asyncio.Queue()
@@ -579,21 +587,25 @@ class JobManager:
         input_path = self.job_dir(job.job_id) / "input" / ("ocr.json" if is_ocr else "book.pdf")
         job.metrics.setdefault("pipeline", {}).setdefault("chunker", {})["ocr_skipped"] = is_ocr
         timeout = httpx.Timeout(CHUNKER_TIMEOUT_SEC, connect=30.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            with input_path.open("rb") as fh:
-                response = await client.post(
-                    f"{CHUNKER_BASE_URL}/v1/jobs",
-                    files={
-                        "ocr_file" if is_ocr else "pdf_file": (
-                            job.filename, fh, "application/json" if is_ocr else "application/pdf"
-                        )
-                    },
-                )
-            if response.status_code >= 400:
-                await self.fail(job, "CHUNKER_SUBMIT_FAILED", response.text)
-                return
-            submit = response.json()
-            downstream_job_id = submit.get("job_id")
+        async with httpx.AsyncClient(timeout=timeout, headers=self.chunker_request_headers(job)) as client:
+            downstream_job_id = job.downstream_job_id if self.resume_children else None
+            submit = {}
+            if not downstream_job_id:
+                with input_path.open("rb") as fh:
+                    response = await client.post(
+                        f"{CHUNKER_BASE_URL}/v1/jobs",
+                        headers=self.chunker_request_headers(job),
+                        files={
+                            "ocr_file" if is_ocr else "pdf_file": (
+                                job.filename, fh, "application/json" if is_ocr else "application/pdf"
+                            )
+                        },
+                    )
+                if response.status_code >= 400:
+                    await self.fail(job, "CHUNKER_SUBMIT_FAILED", response.text)
+                    return
+                submit = response.json()
+                downstream_job_id = submit.get("job_id")
             if not downstream_job_id:
                 await self.fail(job, "CHUNKER_BAD_RESPONSE", json.dumps(submit, ensure_ascii=False))
                 return
@@ -751,7 +763,7 @@ class JobManager:
         async with httpx.AsyncClient(timeout=8.0) as client:
             while not stop_event.is_set():
                 try:
-                    response = await client.get(f"{SFT_GENERATOR_BASE_URL}/telemetry/{run_id}")
+                    response = await client.get(f"{SFT_GENERATOR_BASE_URL}/telemetry/{run_id}", headers={'X-Service-Token': os.getenv('OPS_SERVICE_TOKEN', '')})
                     if response.status_code == 200:
                         snapshot = response.json()
                         if snapshot.get("status") != "not_found":
@@ -874,6 +886,7 @@ class JobManager:
                         response = await client.post(
                             f"{SFT_ORCHESTRATOR_BASE_URL}/run",
                             json=payload,
+                            headers=self.sft_request_headers(job, index),
                             timeout=SFT_TIMEOUT_SEC,
                         )
                         logger.info("SFT /run END job=%s chunk=%s status=%d elapsed=%.1fs", job.job_id, chunk_id, response.status_code, time.perf_counter() - started)
@@ -1042,7 +1055,8 @@ class JobManager:
             logger.info("SFT selection START job=%s candidates=%d budget=%d", job.job_id, len(candidates), book_budget)
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(SFT_BOOK_SELECTION_TIMEOUT_SEC, connect=30.0)) as client:
-                    response = await client.post(f"{SFT_ORCHESTRATOR_BASE_URL}/select_instruction_book", json=payload)
+                    response = await client.post(f"{SFT_ORCHESTRATOR_BASE_URL}/select_instruction_book", json=payload,
+                        headers={'X-Service-Token': os.getenv('OPS_SERVICE_TOKEN', '')})
             except httpx.HTTPError as exc:
                 logger.exception("SFT selection ERROR job=%s elapsed=%.1fs", job.job_id, time.monotonic() - selection_started)
                 await self.fail(job, "SFT_BOOK_SELECTION_REQUEST_FAILED", f"{type(exc).__name__}: {exc}")
@@ -1281,6 +1295,8 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Book2SFT", version="0.2.0-full-pipeline", lifespan=lifespan)
+from .legacy_security import LegacySecurity
+app.add_middleware(LegacySecurity)
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 

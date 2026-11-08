@@ -283,85 +283,12 @@ class MonitorIndex:
             old = self._cached.get(key)
             if old and time.monotonic() - old[0] < 20:
                 return {**old[1], "indexing": self.syncing}
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat() if days else ""
-        where = " WHERE created_at >= ?" if since else ""
+        from .monitoring_queries import summary
         with self.connection() as conn:
-            rows = conn.execute(
-                "SELECT status,stage,input_type,created_at,duration_sec,chunk_count,completed_chunks,failed_chunks,"
-                "generated_pairs,selected_pairs,error_code,timings_json,internal_timings_json FROM jobs" + where,
-                [since] if since else [],
-            ).fetchall()
-        status_counts: Counter[str] = Counter()
-        error_counts: Counter[str] = Counter()
-        throughput: dict[str, Counter[str]] = defaultdict(Counter)
-        durations: list[float] = []
-        group_times: dict[str, list[float]] = defaultdict(list)
-        group_states: dict[str, Counter[str]] = defaultdict(Counter)
-        internal_sum: Counter[str] = Counter()
-        total_chunks = total_failed_chunks = total_selected = total_generated = 0
-        input_counts: Counter[str] = Counter()
-        for row in rows:
-            status = row["status"]
-            status_counts[status] += 1
-            input_counts[row["input_type"]] += 1
-            throughput[str(row["created_at"])[:10]][status] += 1
-            if row["error_code"]:
-                error_counts[row["error_code"]] += 1
-            elif (row["failed_chunks"] or 0) > 0:
-                error_counts["PARTIAL_SFT_CHUNK_FAILURES"] += 1
-            if row["duration_sec"] is not None:
-                durations.append(as_float(row["duration_sec"]))
-            total_chunks += row["chunk_count"] or 0
-            total_failed_chunks += row["failed_chunks"] or 0
-            total_selected += row["selected_pairs"] or 0
-            total_generated += row["generated_pairs"] or 0
-            stage_timings = json.loads(row["timings_json"] or "{}")
-            per_group: Counter[str] = Counter()
-            observed_states: dict[str, set[str]] = defaultdict(set)
-            for name, raw in stage_timings.items():
-                if not isinstance(raw, dict):
-                    continue
-                group = STAGE_GROUPS.get(name)
-                if not group:
-                    continue
-                state = str(raw.get("status") or "waiting")
-                if state != "waiting":
-                    observed_states[group].add(state)
-                if state in {"completed", "failed"}:
-                    per_group[group] += as_float(raw.get("elapsed_sec"))
-            for group, states in observed_states.items():
-                # A running phase takes precedence over an earlier completed phase.
-                overall_state = ("failed" if "failed" in states else
-                                 "running" if "running" in states else
-                                 "completed" if "completed" in states else "skipped")
-                group_states[group][overall_state] += 1
-            for group, elapsed in per_group.items():
-                group_times[group].append(elapsed)
-            internal = json.loads(row["internal_timings_json"] or "{}")
-            for name, value in internal.items():
-                internal_sum[name] += as_float(value)
-        daily = [{"date": day, "total": sum(count.values()),
-                  "completed": count["completed"], "failed": count["failed"]}
-                 for day, count in sorted(throughput.items())]
-        response = {
-            "period_days": days, "total_jobs": len(rows), "statuses": dict(status_counts),
-            "inputs": dict(input_counts), "total_chunks": total_chunks,
-            "failed_chunks": total_failed_chunks, "generated_pairs": total_generated,
-            "selected_pairs": total_selected,
-            "job_success_rate": round(100 * status_counts["completed"] / max(1, status_counts["completed"] + status_counts["failed"]), 1),
-            "chunk_failure_rate": round(100 * total_failed_chunks / max(1, total_chunks), 1),
-            "duration_sec": {"avg": round(statistics.mean(durations), 2) if durations else None,
-                             "p50": percentile(durations, 50), "p95": percentile(durations, 95)},
-            "services": [{"name": name, "jobs": len(values),
-                          "avg_sec": round(statistics.mean(values), 2),
-                          "p50_sec": percentile(values, 50), "p95_sec": percentile(values, 95),
-                          "states": dict(group_states[name])}
-                         for name, values in sorted(group_times.items())],
-            "internal_timings_sum_sec": dict(internal_sum.most_common(25)),
-            "errors": [{"code": k, "count": v} for k, v in error_counts.most_common(12)],
-            "daily": daily, "indexing": self.syncing, "last_sync_at": self.last_sync_at,
-            "last_sync_error": self.last_sync_error,
-        }
+            conn.execute("PRAGMA temp_store=FILE")
+            response = summary(conn, days)
+        response.update(indexing=self.syncing, last_sync_at=self.last_sync_at,
+                        last_sync_error=self.last_sync_error)
         with self._cache_lock:
             self._cached[key] = (time.monotonic(), response)
         return response
