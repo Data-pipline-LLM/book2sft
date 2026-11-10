@@ -8,7 +8,7 @@ from sqlalchemy import select, func
 import test_ops as support
 from backend.ops.activities import BookActivities
 from backend.ops.runtime import Runtime
-from backend.ops.workflow_logic import drive_book
+from backend.ops.workflow_logic import drive_book, LEGACY_STAGES
 from backend.ops.outbox import Outbox
 from backend.ops.schema import commands, chunks, stages, attempts, slots, jobs, audit
 from backend.ops.analytics import Analytics
@@ -41,10 +41,29 @@ class WorkflowCase(unittest.IsolatedAsyncioTestCase):
         async def call(name, payload): return await getattr(activities, name)(payload)
         async def wait(): self.fail('unexpected wait')
         self.assertEqual(await drive_book(jid, call, wait), 'completed')
-        self.assertEqual(calls, ['chunker','sft','review','publish'])
+        self.assertEqual(calls, ['ocr','chunker','sft','review','publish'])
         self.assertEqual(await drive_book(jid, call, wait), 'completed')
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 5)
         self.assertEqual((await self.store.get(jid))['status'], 'completed')
+
+    async def test_legacy_stage_sequence_remains_available_for_old_workflows(self):
+        jid = await self.new()
+        runtime = Runtime(self.store)
+        calls = []
+        class Adapter:
+            async def cancel(self, unused): return True
+            async def execute(self, current, stage):
+                calls.append(stage)
+                await runtime.checkpoint(current, stage, 'completed', {'files': {}})
+                return {'state': 'completed'}
+        activities = BookActivities(self.store, Adapter())
+        async def call(name, payload): return await getattr(activities, name)(payload)
+        async def wait(): self.fail('unexpected wait')
+        self.assertEqual(
+            await drive_book(jid, call, wait, stage_names=LEGACY_STAGES),
+            'completed',
+        )
+        self.assertEqual(calls, list(LEGACY_STAGES))
 
     async def test_mock_pause_resume_and_slot_capacity(self):
         jid = await self.new()

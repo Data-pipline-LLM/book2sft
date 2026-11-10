@@ -13,7 +13,20 @@ x-app-environment: &app-env
   TEMPORAL_ADDRESS: temporal:7233
   TEMPORAL_NAMESPACE: default
   TEMPORAL_TASK_QUEUE: book2sft-books
+  BOOK_WORKFLOW_CAPACITY: ${BOOK_WORKFLOW_CAPACITY:-512}
+  LEGACY_ACTIVITY_WORKERS: ${LEGACY_ACTIVITY_WORKERS:-16}
+  TEMPORAL_OCR_TASK_QUEUE: ${TEMPORAL_OCR_TASK_QUEUE:-book2sft-ocr}
+  TEMPORAL_CHUNKER_TASK_QUEUE: ${TEMPORAL_CHUNKER_TASK_QUEUE:-book2sft-chunker}
+  TEMPORAL_SFT_TASK_QUEUE: ${TEMPORAL_SFT_TASK_QUEUE:-book2sft-sft}
+  TEMPORAL_REVIEW_TASK_QUEUE: ${TEMPORAL_REVIEW_TASK_QUEUE:-book2sft-review}
+  TEMPORAL_PUBLISH_TASK_QUEUE: ${TEMPORAL_PUBLISH_TASK_QUEUE:-book2sft-publish}
+  OCR_STAGE_WORKERS: ${OCR_STAGE_WORKERS:-16}
+  CHUNKER_STAGE_WORKERS: ${CHUNKER_STAGE_WORKERS:-16}
+  SFT_STAGE_WORKERS: ${SFT_STAGE_WORKERS:-16}
+  REVIEW_STAGE_WORKERS: ${REVIEW_STAGE_WORKERS:-4}
+  PUBLISH_STAGE_WORKERS: ${PUBLISH_STAGE_WORKERS:-4}
   CHUNKER_BASE_URL: http://chunker:8080
+  LLM_GATEWAY_BASE_URL: http://llm-gateway:8090
   SFT_ORCHESTRATOR_BASE_URL: http://orchestrator:8000
   SFT_GENERATOR_BASE_URL: http://generator:8000
   SFT_ASSESSMENT_BASE_URL: http://assessment:8000
@@ -31,7 +44,7 @@ x-app-environment: &app-env
   LANGFUSE_TRACE_URL_TEMPLATE: ${LANGFUSE_TRACE_URL_TEMPLATE:-}
 x-sft-environment: &sft-env
   USE_MOCK_MODEL: '0'
-  VLLM_BASE_URL: ${VLLM_BASE_URL:-http://model:8000/v1}
+  VLLM_BASE_URL: http://llm-gateway:8090/v1
   VLLM_MODEL_NAME: ${VLLM_MODEL_NAME:-configured-on-server}
   VLLM_API_KEY: ${VLLM_API_KEY:-}
   OPS_SERVICE_TOKEN: ${OPS_SERVICE_TOKEN:?Set private service token}
@@ -81,6 +94,27 @@ services:
     command: ['python', '-m', 'backend.ops.cli', 'init-storage']
     depends_on: {minio: {condition: service_started}}
     restart: 'no'
+  llm-gateway:
+    image: book2sft-operations:task2
+    build: {context: ., dockerfile: Dockerfile.operations}
+    command: ['uvicorn', 'backend.ops.llm_gateway:app', '--host', '0.0.0.0', '--port', '8090', '--workers', '1', '--no-access-log']
+    environment:
+      LLM_GATEWAY_UPSTREAM_BASE_URL: ${LLM_GATEWAY_UPSTREAM_BASE_URL:-${VLLM_BASE_URL:-http://model:8000/v1}}
+      LLM_GATEWAY_UPSTREAM_API_KEY: ${VLLM_API_KEY:-}
+      LLM_GATEWAY_MAX_CONCURRENCY: ${LLM_GATEWAY_MAX_CONCURRENCY:-400}
+      LLM_GATEWAY_MAX_QUEUE: ${LLM_GATEWAY_MAX_QUEUE:-4000}
+      LLM_GATEWAY_TIMEOUT_SEC: ${LLM_GATEWAY_TIMEOUT_SEC:-7200}
+    healthcheck:
+      test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8090/ready", timeout=3)']
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
   api:
     image: book2sft-operations:task2
     build: {context: ., dockerfile: Dockerfile.operations}
@@ -125,11 +159,15 @@ services:
       OPS_REQUIRE_SERVICE_AUTH: 'true'
       OCR_BASE_URL: ${OCR_BASE_URL:-http://ocr:8091}
       OCR_API_KEY: ${OCR_API_KEY:-}
-      CHUNKER_LLM_URL: ${CHUNKER_LLM_URL:-http://model:8000/v1/chat/completions}
-      CHUNKER_LLM_API_KEY: ${CHUNKER_LLM_API_KEY:-}
+      JOB_WORKERS: ${JOB_WORKERS:-2}
+      CHUNKER_LLM_URL: http://llm-gateway:8090/v1/chat/completions
+      CHUNKER_LLM_API_KEY: ${VLLM_API_KEY:-}
       CHUNKER_LLM_MODEL: ${VLLM_MODEL_NAME:-configured-on-server}
       CHUNKER_LLM_CONCURRENCY: ${CHUNKER_LLM_CONCURRENCY:-16}
+      OCR_WORKERS: ${OCR_STAGE_WORKERS:-16}
+      CHUNKER_WORKERS: ${CHUNKER_STAGE_WORKERS:-16}
     volumes: [chunker:/data/jobs]
+    depends_on: {llm-gateway: {condition: service_healthy}}
     restart: unless-stopped
   orchestrator:
     build: {context: ../Data-construction-pipeline, dockerfile: Dockerfile.staging}
@@ -141,24 +179,28 @@ services:
       TRANSLATION_URL: ${TRANSLATION_URL:-http://translation:8000}
       TRANSLATION_EVALUATION_URL: ${TRANSLATION_EVALUATION_URL:-http://quality:8000}
     volumes: [request-cache:/data/ops-requests]
+    depends_on: {llm-gateway: {condition: service_healthy}}
     restart: unless-stopped
   generator:
     build: {context: ../Data-construction-pipeline, dockerfile: Dockerfile.staging}
     image: book2sft-sft:task2
     environment: *sft-env
     command: ['uvicorn', 'services.generate_instruction.app:app', '--host', '0.0.0.0', '--port', '8000', '--no-access-log']
+    depends_on: {llm-gateway: {condition: service_healthy}}
     restart: unless-stopped
   assessment:
     build: {context: ../Data-construction-pipeline, dockerfile: Dockerfile.staging}
     image: book2sft-sft:task2
     environment: *sft-env
     command: ['uvicorn', 'services.instruction_value_assessment.app:app', '--host', '0.0.0.0', '--port', '8000', '--no-access-log']
+    depends_on: {llm-gateway: {condition: service_healthy}}
     restart: unless-stopped
   quality:
     build: {context: ../Data-construction-pipeline, dockerfile: Dockerfile.staging}
     image: book2sft-sft:task2
     environment: *sft-env
     command: ['uvicorn', 'services.translation_evaluation.app:app', '--host', '0.0.0.0', '--port', '8000', '--no-access-log']
+    depends_on: {llm-gateway: {condition: service_healthy}}
     restart: unless-stopped
   collector:
     image: otel/opentelemetry-collector-contrib:0.123.0

@@ -36,14 +36,17 @@ class PipelineAdapter:
             raise Missing('required artifact unavailable')
         return await asyncio.to_thread(self.objects.get, row['key'])
 
-    async def execute(self, jid, stage, lease=None):
+    async def execute(self, jid, stage, lease=None, legacy_combined=False):
         # Import the actual deployed implementation only in the worker process.
         from .. import main as legacy
         adapter, runtime, store = self, self.runtime, self.store
         record = await store.get(jid)
         config = json.loads(record['config'])
         snapshots = []
-        for name in ('chunker', 'sft', 'review', 'publish'):
+        stage_order = ('chunker', 'sft', 'review', 'publish') if legacy_combined else (
+            'ocr', 'chunker', 'sft', 'review', 'publish'
+        )
+        for name in stage_order:
             row = await runtime.stage(jid, name)
             if row and row['status'] != 'pending':
                 snapshots.append(json.loads(row['snapshot']))
@@ -60,8 +63,9 @@ class PipelineAdapter:
         args.update({key: value for key, value in data.items() if key in allowed and key not in {'job_id'}})
         job = legacy.JobState(**args)
         current_stage = await runtime.stage(jid, stage)
-        if stage == 'chunker' and current_stage and current_stage['status'] == 'pending':
-            job.downstream_job_id = None
+        if stage in {'ocr', 'chunker'}:
+            current_snapshot = json.loads(current_stage['snapshot']) if current_stage else {}
+            job.downstream_job_id = (current_snapshot.get('job') or {}).get('downstream_job_id')
         job.status, job.error = 'running', None
         job.metrics.setdefault('pipeline', {'chunker': {}, 'sft': {}, 'pdf': {}})
         in_flight, all_tasks = set(), set()
@@ -95,10 +99,105 @@ class PipelineAdapter:
                     'X-Book-ID': record['book_id'], 'X-Job-ID': jid}
 
             def chunker_request_headers(self, current):
+                child_stage = getattr(current, '_ops_chunker_stage', 'chunker')
+                input_sha256 = getattr(
+                    current,
+                    '_ops_chunker_input_sha256',
+                    config.get('input_object', {}).get('sha256', ''),
+                )
+                operation_id = (
+                    f'chunker:{jid}:{record["attempt"]}'
+                    if getattr(current, '_ops_legacy_combined_chunker', False)
+                    else f'chunker:{jid}:{record["attempt"]}:{child_stage}'
+                )
                 return {'X-Service-Token': os.environ.get('OPS_SERVICE_TOKEN', ''),
-                        'X-Operation-ID': f'chunker:{jid}:{record["attempt"]}',
-                        'X-Input-SHA256': config.get('input_object', {}).get('sha256', ''),
+                        'X-Operation-ID': operation_id,
+                        'X-Input-SHA256': input_sha256,
                         'X-Book-ID': record['book_id'], 'X-Job-ID': jid}
+
+            async def run_ocr(self, current):
+                """Run only OCR; the next Temporal stage owns semantic chunking."""
+                input_path = self.root / 'input' / 'book.pdf'
+                await self.set_stage(
+                    current, 'ocr', message='Submitting PDF to the OCR service', local_progress=0,
+                )
+                timeout = httpx.Timeout(legacy.CHUNKER_TIMEOUT_SEC, connect=30.0)
+                headers = self.chunker_request_headers(current)
+                headers['X-Chunker-Mode'] = 'ocr-only'
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    downstream_job_id = current.downstream_job_id if self.resume_children else None
+                    submit = {}
+                    if not downstream_job_id:
+                        with input_path.open('rb') as stream:
+                            response = await client.post(
+                                f'{legacy.CHUNKER_BASE_URL}/v1/jobs',
+                                headers=headers,
+                                files={'pdf_file': (current.filename, stream, 'application/pdf')},
+                            )
+                        if response.status_code >= 400:
+                            await self.fail(current, 'OCR_SUBMIT_FAILED', response.text)
+                            return
+                        submit = response.json()
+                        downstream_job_id = submit.get('job_id')
+                    if not downstream_job_id:
+                        await self.fail(current, 'OCR_BAD_RESPONSE', json.dumps(submit, ensure_ascii=False))
+                        return
+
+                    current.downstream_job_id = downstream_job_id
+                    current.metrics.setdefault('pipeline', {}).setdefault('ocr', {}).update({
+                        'job_id': downstream_job_id,
+                        'status': 'queued',
+                    })
+                    await self.persist(current)
+
+                    while True:
+                        status_response = await client.get(
+                            f'{legacy.CHUNKER_BASE_URL}/v1/jobs/{downstream_job_id}'
+                        )
+                        if status_response.status_code >= 400:
+                            await self.fail(current, 'OCR_STATUS_FAILED', status_response.text)
+                            return
+                        downstream = status_response.json()
+                        child_status = str(downstream.get('status') or 'queued').lower()
+                        try:
+                            progress = float(downstream.get('progress') or 0.0)
+                        except (TypeError, ValueError):
+                            progress = 0.0
+                        current.metrics['pipeline']['ocr'].update({
+                            'status': child_status,
+                            'stage': downstream.get('stage'),
+                            'progress': progress,
+                            'updated_at': legacy.utcnow(),
+                        })
+                        await self.set_stage(
+                            current, 'ocr',
+                            message=str(downstream.get('message') or f'OCR: {downstream.get("stage", "queued")}'),
+                            downstream_progress=progress,
+                        )
+                        if child_status == 'failed':
+                            await self.fail(current, 'OCR_FAILED', 'Downstream OCR job failed', downstream=downstream)
+                            return
+                        if child_status == 'cancelled':
+                            raise RuntimeError('Downstream OCR job was cancelled before the Book2SFT cancel command')
+                        if child_status == 'completed':
+                            break
+                        await asyncio.sleep(legacy.POLL_INTERVAL_SEC)
+
+                    artifacts_dir = self.root / 'artifacts'
+                    artifacts_dir.mkdir(parents=True, exist_ok=True)
+                    if not await self.download_chunker_artifact(
+                        client, downstream_job_id, 'ocr.json', artifacts_dir / 'ocr.json'
+                    ):
+                        await self.fail(current, 'OCR_ARTIFACT_MISSING', 'OCR completed but ocr.json was not available')
+                        return
+                    current.metrics['pipeline']['ocr'].update({
+                        'status': 'completed',
+                        'progress': 100,
+                        'ocr_skipped': False,
+                    })
+                    await self.set_stage(current, 'ocr', message='OCR completed; handing off to Chunker', local_progress=100)
+                    await self.finish_stage(current, 'ocr')
+                    await self.persist(current)
 
             async def run_one_sft_chunk(self, client, semaphore, current, source, index):
                 task = asyncio.current_task()
@@ -183,8 +282,42 @@ class PipelineAdapter:
                         ref, _ = await self.put(jid, 'chunk_inputs', encoded(chunk).encode())
                         await store.add_chunk(jid, cid, index, ref)
             async def run():
-                if stage == 'chunker':
-                    await runner.run_chunker(job)
+                if stage == 'ocr':
+                    if job.input_type == 'ocr_json':
+                        # A supplied OCR export already satisfies the OCR stage.
+                        source = root / 'input' / 'ocr.json'
+                        target = root / 'artifacts' / 'ocr.json'
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(source.read_bytes())
+                        job.metrics.setdefault('pipeline', {}).setdefault('ocr', {}).update({
+                            'status': 'completed', 'progress': 100, 'ocr_skipped': True,
+                        })
+                        await runner.set_stage(job, 'ocr', message='OCR skipped: supplied OCR JSON', local_progress=100)
+                        await runner.finish_stage(job, 'ocr')
+                    else:
+                        job._ops_chunker_stage = 'ocr'
+                        job._ops_chunker_input_sha256 = config.get('input_object', {}).get('sha256', '')
+                        await runner.run_ocr(job)
+                elif stage == 'chunker':
+                    if legacy_combined:
+                        # A pre-Task-3.1 Temporal history owns one combined
+                        # Chunker activity; preserve its PDF/OCR input and
+                        # deterministic child operation ID during replay.
+                        job._ops_legacy_combined_chunker = True
+                        await runner.run_chunker(job)
+                    else:
+                        ocr_reference = files.get('artifacts/ocr.json')
+                        if not ocr_reference:
+                            raise Missing('OCR checkpoint artifact is required before Chunker')
+                        ocr_bytes = await adapter.read(ocr_reference)
+                        ocr_input = root / 'input' / 'ocr.json'
+                        ocr_input.parent.mkdir(parents=True, exist_ok=True)
+                        ocr_input.write_bytes(ocr_bytes)
+                        job._chunker_use_ocr_input = True
+                        job._chunker_upload_filename = 'ocr.json'
+                        job._ops_chunker_stage = 'chunker'
+                        job._ops_chunker_input_sha256 = hashlib.sha256(ocr_bytes).hexdigest()
+                        await runner.run_chunker(job)
                 elif stage == 'sft':
                     await runner.run_sft(job)
                 elif stage == 'review':
@@ -236,19 +369,40 @@ class PipelineAdapter:
         from ..main import CHUNKER_BASE_URL, SFT_ORCHESTRATOR_BASE_URL
         import uuid
         record = await self.store.get(jid)
-        child = str(uuid.uuid5(uuid.NAMESPACE_URL, f'chunker:{jid}:{record["attempt"]}'))
-        child_stage = await self.runtime.stage(jid, 'chunker')
-        if child_stage is None:
-            return True
-        if child_stage:
-            child = json.loads(child_stage['snapshot']).get('job', {}).get('downstream_job_id') or child
         headers = {'X-Service-Token': os.environ.get('OPS_SERVICE_TOKEN', '')}
         async with httpx.AsyncClient(timeout=10, headers=headers) as client:
-            response = await client.post(f'{CHUNKER_BASE_URL}/v1/jobs/{child}/cancel')
-            if response.status_code >= 400:
-                return False
-            if response.json().get('status') not in {'cancelled', 'completed', 'failed'}:
-                return False
+            children = []
+            for stage_name in ('ocr', 'chunker'):
+                child_stage = await self.runtime.stage(jid, stage_name)
+                if child_stage is None:
+                    continue
+                snapshot = json.loads(child_stage['snapshot'])
+                child = (snapshot.get('job') or {}).get('downstream_job_id')
+                if not child:
+                    candidates = [str(uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f'chunker:{jid}:{record["attempt"]}:{stage_name}',
+                    ))]
+                    if stage_name == 'chunker':
+                        # Also tombstone the Task 2 combined-child ID in case an
+                        # older activity created it but crashed before checkpoint.
+                        candidates.append(str(uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f'chunker:{jid}:{record["attempt"]}',
+                        )))
+                else:
+                    candidates = [child]
+                for candidate in candidates:
+                    if candidate not in children:
+                        children.append(candidate)
+            for child in children:
+                response = await client.post(f'{CHUNKER_BASE_URL}/v1/jobs/{child}/cancel')
+                if response.status_code == 404:
+                    continue
+                if response.status_code >= 400:
+                    return False
+                if response.json().get('status') not in {'cancelled', 'completed', 'failed'}:
+                    return False
             cursor = None
             while True:
                 page = await self.store.page(chunks, job_id=jid, cursor=cursor, limit=100)

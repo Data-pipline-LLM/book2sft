@@ -138,6 +138,7 @@ def install(app, store, objects, principal, worker_available):
     @app.get('/v1/ops/services')
     async def services(p=Depends(principal)):
         urls = {'chunker': os.getenv('CHUNKER_BASE_URL', 'http://chunker:8080'),
+                'llm_gateway': os.getenv('LLM_GATEWAY_BASE_URL', 'http://llm-gateway:8090'),
                 'sft_orchestrator': os.getenv('SFT_ORCHESTRATOR_BASE_URL', 'http://orchestrator:8000'),
                 'sft_generator': os.getenv('SFT_GENERATOR_BASE_URL', 'http://generator:8000'),
                 'sft_assessment': os.getenv('SFT_ASSESSMENT_BASE_URL', 'http://assessment:8000'),
@@ -146,9 +147,24 @@ def install(app, store, objects, principal, worker_available):
             started = time.monotonic()
             try:
                 async with httpx.AsyncClient(timeout=3) as client:
-                    response = await client.get(url.rstrip('/') + '/health')
-                return {'name': name, 'health': 'healthy' if response.is_success else 'unhealthy',
-                        'probe_latency_sec': time.monotonic() - started, 'at': store.clock()}
+                    health_path = '/ready' if name == 'llm_gateway' else '/health'
+                    response = await client.get(url.rstrip('/') + health_path)
+                payload = response.json() if response.is_success else {}
+                result = {'name': name, 'health': 'healthy' if response.is_success else 'unhealthy',
+                          'probe_latency_sec': time.monotonic() - started, 'at': store.clock()}
+                if name == 'llm_gateway' and response.is_success:
+                    async with httpx.AsyncClient(timeout=3) as client:
+                        metrics_response = await client.get(url.rstrip('/') + '/internal/metrics')
+                    metrics_payload = metrics_response.json() if metrics_response.is_success else {}
+                    result['metrics'] = {
+                        'active': int(metrics_payload.get('active') or 0),
+                        'capacity': int(metrics_payload.get('capacity') or 0),
+                        'queued': int(metrics_payload.get('queued') or 0),
+                        'slots_available': int(metrics_payload.get('slots_available') or 0),
+                        'target_reached': bool(metrics_payload.get('target_reached')),
+                        'clients': metrics_payload.get('clients') or {},
+                    }
+                return result
             except httpx.HTTPError:
                 return {'name': name, 'health': 'unknown', 'probe_latency_sec': None, 'at': store.clock()}
         fleet = await analytics.fleet()

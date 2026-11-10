@@ -44,13 +44,15 @@ class Outbox:
 
 
 class TemporalTransport:
-    def __init__(self, client, task_queue='book2sft-books'):
+    def __init__(self, client, task_queue='book2sft-books', stage_queues=None):
         self.client, self.task_queue = client, task_queue
+        self.stage_queues = dict(stage_queues or {})
 
     async def deliver(self, jid, message):
         from temporalio.common import WorkflowIDReusePolicy
         from .temporal_workflow import BookWorkflow
         await self.client.start_workflow(BookWorkflow.run, jid,
+            self.stage_queues,
             id='book2sft/' + jid, task_queue=self.task_queue,
             id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
             start_signal='wake', start_signal_args=[message])

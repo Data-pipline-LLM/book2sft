@@ -578,13 +578,17 @@ class JobManager:
         await self.complete(job)
 
     async def run_chunker(self, job: JobState) -> None:
-        is_ocr = job.input_type == "ocr_json"
+        # The operational adapter may split OCR and semantic chunking into
+        # separate Temporal stages while keeping the public JobState input type
+        # (PDF vs supplied OCR JSON) unchanged.
+        is_ocr = bool(getattr(job, "_chunker_use_ocr_input", job.input_type == "ocr_json"))
         await self.set_stage(
             job, "chunker_submit",
             message="Submitting OCR JSON to Chunker API (skip OCR)" if is_ocr else "Submitting PDF to Chunker API",
             local_progress=0,
         )
         input_path = self.job_dir(job.job_id) / "input" / ("ocr.json" if is_ocr else "book.pdf")
+        upload_filename = getattr(job, "_chunker_upload_filename", job.filename)
         job.metrics.setdefault("pipeline", {}).setdefault("chunker", {})["ocr_skipped"] = is_ocr
         timeout = httpx.Timeout(CHUNKER_TIMEOUT_SEC, connect=30.0)
         async with httpx.AsyncClient(timeout=timeout, headers=self.chunker_request_headers(job)) as client:
@@ -597,7 +601,7 @@ class JobManager:
                         headers=self.chunker_request_headers(job),
                         files={
                             "ocr_file" if is_ocr else "pdf_file": (
-                                job.filename, fh, "application/json" if is_ocr else "application/pdf"
+                                upload_filename, fh, "application/json" if is_ocr else "application/pdf"
                             )
                         },
                     )

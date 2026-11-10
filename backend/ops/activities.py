@@ -48,6 +48,10 @@ class BookActivities:
         async with self.store.db.transaction() as conn:
             done = (await conn.execute(select(stages.c.name).where(and_(stages.c.job_id == jid,
                 stages.c.status == 'completed')))).scalars().all()
+        # Task 2's combined Chunker stage already performed OCR. This synthetic
+        # completion marker keeps upgraded/retried jobs from OCR-ing twice.
+        if 'chunker' in done and 'ocr' not in done:
+            done.append('ocr')
         return {'status': job['status'], 'completed_stages': done}
 
     async def stage(self, request, *, retry_attempt=1, lease=None):
@@ -69,7 +73,10 @@ class BookActivities:
                 await asyncio.sleep(5)
         ticker = asyncio.create_task(beat())
         try:
-            result = await self.adapter.execute(jid, name, lease=lease) if lease else await self.adapter.execute(jid, name)
+            if request.get('legacy_combined'):
+                result = await self.adapter.execute(jid, name, lease=lease, legacy_combined=True)
+            else:
+                result = await self.adapter.execute(jid, name, lease=lease) if lease else await self.adapter.execute(jid, name)
             return result
         finally:
             stop.set()
@@ -104,10 +111,11 @@ class BookActivities:
             await self.store.command(jid, 'cancel', 'workflow', 'admin', 'workflow-cancel-' + str(job['epoch']))
         return await self.sync(request)
 
-    def temporal_bindings(self):
+    def temporal_bindings(self, names=None):
         from temporalio import activity
         bound = []
-        for name in ('sync', 'stage', 'release', 'failure', 'finish', 'external_cancel'):
+        selected = names or ('sync', 'stage', 'release', 'failure', 'finish', 'external_cancel')
+        for name in selected:
             method = getattr(self, name)
             def make(method, is_stage):
                 async def execute(request: dict) -> dict:
