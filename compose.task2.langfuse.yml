@@ -1,0 +1,23 @@
+services:
+  api:
+    networks: [default, langfuse]
+
+  worker:
+    networks: [default, langfuse]
+
+  orchestrator:
+    networks: [default, langfuse]
+
+  generator:
+    networks: [default, langfuse]
+
+  assessment:
+    networks: [default, langfuse]
+
+  quality:
+    networks: [default, langfuse]
+
+networks:
+  langfuse:
+    external: true
+    name: langfuse-staging_default
