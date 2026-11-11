@@ -114,6 +114,67 @@
     $('kpiPairs').textContent=num(accepted);
     $('kpiPairsSub').textContent=`Quality pass ${num(accepted)} / Generated ${num(generated)} · ${days} روز`;
   }
+  const stageLabels = {queued:'در صف', ocr:'OCR', chunker:'Chunker', sft:'SFT', review:'Review',
+    publish:'Publish',between_stages:'بین مراحل',paused:'مکث',completed:'تکمیل',failed:'خطا',
+    cancelled:'لغو شده',archived:'آرشیو'};
+  const stageKeys = ['queued','ocr','chunker','sft','review','publish','between_stages','paused','completed','failed'];
+  let liveBusy = false;
+  const asNum = value => value == null ? null : Number(value);
+  function showLivePipeline(data){
+    const counters = {...(data.stages||{}), queued:data.queued, between_stages:data.between_stages,
+      paused:data.paused, completed:data.completed, failed:data.failed};
+    $('liveStageCounters').innerHTML=stageKeys.map(key=>`<div class="live-stage-tile live-stage-${key}">
+      <span>${escapeHTML(stageLabels[key]||key)}</span><strong>${num(counters[key]||0)}</strong></div>`).join('');
+    $('livePipelineUpdated').textContent='آخرین داده: '+when(data.at);
+    const rows=(data.items||[]);
+    $('liveBookRows').innerHTML=rows.map(j=>{
+      const stageLabel=stageLabels[j.stage]||j.stage||'—';
+      const state=j.stage_state==='waiting_for_stage'?' (در انتظار Worker)':j.stage_state==='failed'?' (ناموفق)':'';
+      const pct=asNum(j.progress), local=asNum(j.stage_progress);
+      const progress=j.progress==null||!Number.isFinite(pct)?'—':`${num(Math.min(100,Math.max(0,pct)))}٪`;
+      const localProgress=j.stage_progress==null||!Number.isFinite(local)?'':` · مرحله ${num(Math.min(100,Math.max(0,local)))}٪`;
+      const sft=j.sft_chunks_total==null?'—':`${num(j.sft_chunks_completed||0)}/${num(j.sft_chunks_total)} · فعال ${num(j.sft_chunks_active||0)}`;
+      const updated=j.stage_last_update || j.updated;
+      return `<tr data-live-open="${escapeHTML(j.id)}" tabindex="0" role="button" aria-label="جزئیات ${escapeHTML(j.title)}">
+        <td><strong>${escapeHTML(j.title)}</strong><small>${j.ocr_skipped?'OCR JSON · بدون اجرای OCR':'PDF · OCR لازم'}</small></td>
+        <td><span class="status-tag status-${escapeHTML(j.status)}">${escapeHTML(labels[j.status]||j.status)}</span></td>
+        <td><strong>${escapeHTML(stageLabel+state)}</strong><small>${escapeHTML(j.substage||'')}${j.message?' · '+escapeHTML(j.message):''}</small></td>
+        <td>${progress}<small>${localProgress}</small></td>
+        <td>${escapeHTML(sft)}</td><td>${num(j.sft_chunk_attempts)}</td>
+        <td><small>${when(updated)}</small></td></tr>`;
+    }).join('')||'<tr><td colspan="7">کتابی ثبت نشده است.</td></tr>';
+    $('liveBooksNote').textContent = `${num(rows.length)} کتاب اخیر از ${num(data.total_jobs)} Job ثبت‌شده. `+
+      'تعداد تلاش Chunk برابر با درخواست LLM نیست؛ شمارنده Call به تفکیک کتاب هنوز در دسترس نیست.';
+  }
+  function showLiveLLM(d){
+    $('liveLLMUpdated').textContent=d.available?'آخرین داده: '+when(d.at):'ارتباط با Gateway قطع است';
+    if(!d.available){
+      $('liveLLMNumbers').innerHTML=placeholder('داده Gateway فعلاً در دسترس نیست؛ صفر فرض نمی‌شود.');
+      $('liveLLMMeterFill').style.width='0%'; $('liveLLMClients').innerHTML=''; return;
+    }
+    const capacity=Math.max(0,Number(d.capacity)||0), active=Math.max(0,Number(d.active)||0);
+    const cards=[['درخواست فعال',`${num(active)} / ${num(capacity)}`],['صف LLM',num(d.queued)],
+      ['Slot آزاد',num(d.slots_available)],['موفق از شروع Gateway',num(d.total_completed)],
+      ['ناموفق',num(d.total_failed)],['رد شده',num(d.total_rejected)]];
+    $('liveLLMNumbers').innerHTML=cards.map(([k,v])=>`<div><span>${escapeHTML(k)}</span><strong>${escapeHTML(v)}</strong></div>`).join('');
+    $('liveLLMMeterFill').style.width=(capacity?Math.min(100,100*active/capacity):0)+'%';
+    const clients=Object.entries(d.clients||{});
+    $('liveLLMClients').innerHTML=clients.length
+      ? `<h3>تقسیم درخواست‌ها بین Clientها</h3><div class="live-client-grid">${clients.map(([name,v])=>
+          `<div><strong>${escapeHTML(name)}</strong><span>فعال ${num(v.active)} · صف ${num(v.queued)} · موفق ${num(v.completed)}</span></div>`).join('')}</div>`
+      : '<small class="muted">هنوز هیچ Client درخواست ثبت‌شده‌ای در Gateway ندارد.</small>';
+  }
+  async function loadLive(){
+    if(liveBusy)return;
+    liveBusy=true;
+    try{
+      const results=await Promise.allSettled([api('/v1/ops/live-pipeline?limit=50'),api('/v1/ops/live-llm')]);
+      if(results[0].status==='fulfilled')showLivePipeline(results[0].value);
+      else {$('livePipelineUpdated').textContent='خطای API: '+results[0].reason.message;}
+      if(results[1].status==='fulfilled')showLiveLLM(results[1].value);
+      else showLiveLLM({available:false});
+    }finally{liveBusy=false;}
+  }
   async function loadHealth(){
     const data=await api('/v1/ops/services');
     const checks=data.services||[];
@@ -298,7 +359,7 @@
     if(!alive()||busy)return;
     busy=true;
     try {
-      const tasks=[loadOverview(),loadHealth(),loadJobs()];
+      const tasks=[loadOverview(),loadHealth(),loadJobs(),loadLive()];
       if(force || !window.__lastAnalytics || Date.now()-window.__lastAnalytics > 60000){tasks.push(loadAnalytics().then(()=>{window.__lastAnalytics=Date.now();}));}
       const results=await Promise.allSettled(tasks);
       const failures=results.filter(x=>x.status==='rejected');
@@ -359,6 +420,9 @@
   $('retentionPreview').onclick=async()=>{try{const result=await api('/v1/admin/retention/preview',{method:'POST'});note(`پیش‌نمایش: ${num(result.count)} فایل (${num(result.bytes)} بایت)، حذف انجام نشد.`);}catch(e){note(e.message,true);}};
   $('retentionDryRun').onclick=async()=>{try{const result=await api('/v1/admin/retention/runs',{method:'POST',json:{dry_run:true}});note(`Dry-run ثبت شد: ${result.run_id}`);}catch(e){note(e.message,true);}};
   setInterval(()=>{if(alive()&&$('monitorAuto').checked&&!selectedJob)refresh();},15000);
+  setInterval(()=>{if(alive()&&$('monitorAuto').checked)loadLive().catch(e=>note('Live: '+e.message,true));},5000);
+  $('liveBookRows').addEventListener('click',e=>{const r=e.target.closest('[data-live-open]');if(r)openJob(r.dataset.liveOpen);});
+  $('liveBookRows').addEventListener('keydown',e=>{if(e.key==='Enter'){const r=e.target.closest('[data-live-open]');if(r)openJob(r.dataset.liveOpen);}});
   // Lightweight progress polling while inspecting a running job. Do not reload
   // 50 chunks/attempts/events/artifacts on each tick.
   let drawerProgressPolling=false;

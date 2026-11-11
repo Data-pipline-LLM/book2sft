@@ -135,6 +135,35 @@ def install(app, store, objects, principal, worker_available):
         end = until if until is not None else store.clock()
         return await analytics.series(since if since is not None else end - 86400, end, max_points)
 
+    @app.get('/v1/ops/live-pipeline')
+    async def live_pipeline(limit: int = 50, p=Depends(principal)):
+        from .live_pipeline import live_snapshot
+        return await live_snapshot(store, limit=limit)
+
+    @app.get('/v1/ops/live-llm')
+    async def live_llm(p=Depends(principal)):
+        # Metrics only: never route model requests or send service credentials.
+        url = os.getenv('LLM_GATEWAY_BASE_URL', 'http://llm-gateway:8090').rstrip('/')
+        try:
+            async with httpx.AsyncClient(timeout=2.5) as client:
+                response = await client.get(url + '/internal/metrics')
+                response.raise_for_status()
+            raw = response.json()
+            return {'available': True, 'at': store.clock(),
+                    'capacity': raw.get('capacity'), 'active': raw.get('active'),
+                    'queued': raw.get('queued'), 'queue_limit': raw.get('queue_limit'),
+                    'slots_available': raw.get('slots_available'),
+                    'total_completed': raw.get('total_completed'),
+                    'total_failed': raw.get('total_failed'),
+                    'total_rejected': raw.get('total_rejected'),
+                    'clients': raw.get('clients') or {},
+                    'counter_scope': 'since_gateway_start',
+                    'per_book_available': False}
+        except (httpx.HTTPError, ValueError, TypeError):
+            # Connection failure is unknown, never silently report zero calls.
+            return {'available': False, 'at': store.clock(),
+                    'reason': 'gateway metrics unavailable'}
+
     @app.get('/v1/ops/services')
     async def services(p=Depends(principal)):
         urls = {'chunker': os.getenv('CHUNKER_BASE_URL', 'http://chunker:8080'),

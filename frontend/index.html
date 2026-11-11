@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Book2SFT</title>
-  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=live-pipeline-1" />
 </head>
 <body>
   <header class="app-header">
@@ -136,6 +136,21 @@
         <article class="kpi"><span>خروجی SFT</span><strong id="kpiPairs">—</strong><small id="kpiPairsSub">—</small></article>
         <article class="kpi"><span>زمان باقی‌مانده</span><strong id="kpiEta">—</strong><small>برآورد فقط برای چانک‌های شناخته‌شده</small></article>
       </section>
+      <section class="dashboard-card live-pipeline-card" aria-label="مانیتورینگ زنده پایپلاین">
+        <div class="section-heading"><div><span class="small-label">LIVE PIPELINE · هر ۵ ثانیه</span><h2>کتاب‌ها الان کجا هستند؟</h2></div><small id="livePipelineUpdated">در انتظار داده…</small></div>
+        <div class="live-stage-grid" id="liveStageCounters" aria-live="polite"></div>
+        <p class="muted mini-explain">عدد هر مرحله، تعداد Jobهایی است که همین الان آن Stage را اجرا می‌کنند؛ «بین مراحل» یعنی Job در حال اجراست اما Stage فعالی ثبت نشده.</p>
+        <div class="section-heading live-section-heading"><div><span class="small-label">LIVE BOOKS</span><h3>وضعیت آخرین کتاب‌ها</h3></div><small>برای مشاهده جزئیات روی کتاب کلیک کن · حداکثر ۵۰ کتاب اخیر</small></div>
+        <div class="live-book-table-wrap"><table class="live-book-table"><thead><tr><th>کتاب / ورودی</th><th>وضعیت</th><th>مرحله فعلی</th><th>پیشرفت</th><th>SFT Chunk</th><th>تلاش Chunk</th><th>آخرین ثبت</th></tr></thead><tbody id="liveBookRows"><tr><td colspan="7">در انتظار اطلاعات زنده…</td></tr></tbody></table></div>
+        <small class="muted" id="liveBooksNote">تلاش Chunk معادل تعداد Call واقعی به vLLM نیست؛ شمارنده تفکیکی LLM هر کتاب هنوز ثبت نمی‌شود.</small>
+      </section>
+      <section class="dashboard-card live-llm-card" aria-label="درخواست‌های زنده LLM">
+        <div class="section-heading"><div><span class="small-label">LLM GATEWAY · ظرفیت مشترک</span><h2>مدل الان چند درخواست گرفته؟</h2></div><small id="liveLLMUpdated">در انتظار داده…</small></div>
+        <div id="liveLLMNumbers" class="live-llm-numbers" aria-live="polite"></div>
+        <div class="live-llm-meter"><div id="liveLLMMeterFill"></div></div>
+        <div id="liveLLMClients" class="live-clients"></div>
+        <p class="muted mini-explain">Active درخواست‌های در حال عبور از Gateway است؛ الزاماً برابر با Running Sequence داخل vLLM نیست. شمارنده‌های موفق/ناموفق با Restart شدن Gateway صفر می‌شوند.</p>
+      </section>
       <section class="monitor-analytics-grid" aria-label="نمودارهای تحلیلی">
         <article class="dashboard-card graph-large"><div class="section-heading"><div><span class="small-label">THROUGHPUT</span><h3>تولید و پذیرش کیفیت SFT</h3></div><small>جفت در هر بازه · Quality Pass ≠ انتخاب نهایی کتاب</small></div><div id="pairsChart" class="chart-holder" aria-live="polite"></div></article>
         <article class="dashboard-card graph-small"><div class="section-heading"><div><span class="small-label">LIVE STATUS</span><h3>وضعیت Jobها</h3></div></div><div id="statusChart" class="chart-holder"></div></article>
@@ -170,6 +185,6 @@
     <div class="drawer-body" id="drawerBody"></div></aside>
   </div>
   <script src="/static/app.js"></script>
-  <script src="/static/monitoring.js"></script>
+  <script src="/static/monitoring.js?v=live-pipeline-1"></script>
 </body>
 </html>
