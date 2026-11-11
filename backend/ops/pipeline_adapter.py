@@ -124,7 +124,10 @@ class PipelineAdapter:
                 timeout = httpx.Timeout(legacy.CHUNKER_TIMEOUT_SEC, connect=30.0)
                 headers = self.chunker_request_headers(current)
                 headers['X-Chunker-Mode'] = 'ocr-only'
-                async with httpx.AsyncClient(timeout=timeout) as client:
+                async with httpx.AsyncClient(
+                    timeout=timeout,
+                    headers={'X-Service-Token': headers['X-Service-Token']},
+                ) as client:
                     downstream_job_id = current.downstream_job_id if self.resume_children else None
                     submit = {}
                     if not downstream_job_id:
