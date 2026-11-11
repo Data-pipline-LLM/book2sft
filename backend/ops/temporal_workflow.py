@@ -64,7 +64,7 @@ class BookWorkflow:
             if result == 'continue_as_new':
                 # Carry the selected execution contract across Continue-As-New;
                 # a fresh run has a fresh history and cannot infer the old patch.
-                workflow.continue_as_new(job_id, stage_queues, not use_stage_queues)
+                workflow.continue_as_new(args=[job_id, stage_queues, not use_stage_queues])
             return result
         except asyncio.CancelledError:
             # External cancellation is not an implicit successful business cancel.

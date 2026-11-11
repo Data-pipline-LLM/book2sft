@@ -51,8 +51,10 @@ class TemporalTransport:
     async def deliver(self, jid, message):
         from temporalio.common import WorkflowIDReusePolicy
         from .temporal_workflow import BookWorkflow
-        await self.client.start_workflow(BookWorkflow.run, jid,
-            self.stage_queues,
+        # Temporal's Python client accepts only one positional workflow argument.
+        # Multiple workflow arguments must be passed through the `args` keyword.
+        await self.client.start_workflow(BookWorkflow.run,
+            args=[jid, self.stage_queues],
             id='book2sft/' + jid, task_queue=self.task_queue,
             id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
             start_signal='wake', start_signal_args=[message])

@@ -108,8 +108,10 @@ async def run():
                     await transport.reconcile_slots(store)
                     last_reconcile = time.monotonic()
                 await dispatcher.tick()
-            except Exception as exc:
-                logging.getLogger(__name__).error('Dispatcher retry: %s', type(exc).__name__)
+            except Exception:
+                # Keep the traceback: an exception class alone cannot identify
+                # whether dispatch, heartbeat or reconciliation has failed.
+                logging.getLogger(__name__).exception('Dispatcher/upkeep retry')
             await asyncio.sleep(2)
 
     upkeep_task = asyncio.create_task(upkeep())
